@@ -1,0 +1,16 @@
+INFO:     Will watch for changes in these directories: ['/Users/jiexu/coding/AI/teaching/deeplearning-projects/real-projects/08-09-Electronic-Industry-agent-2']
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process [66654] using WatchFiles
+INFO:     Started server process [66657]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+Database connection pool created successfully
+INFO:     127.0.0.1:53097 - "OPTIONS /api/call-llm-stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53097 - "POST /api/call-llm-stream HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53097 - "OPTIONS /api/sql-query HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53097 - "POST /api/sql-query HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [66657]
+INFO:     Stopping reloader process [66654]
