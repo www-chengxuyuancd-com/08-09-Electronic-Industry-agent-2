@@ -1,16 +1,14 @@
 INFO:     Will watch for changes in these directories: ['/Users/jiexu/coding/AI/teaching/deeplearning-projects/real-projects/08-09-Electronic-Industry-agent-2']
 INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-INFO:     Started reloader process [66654] using WatchFiles
-INFO:     Started server process [66657]
+INFO:     Started reloader process [10596] using WatchFiles
+INFO:     Started server process [10599]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
 Database connection pool created successfully
-INFO:     127.0.0.1:53097 - "OPTIONS /api/call-llm-stream HTTP/1.1" 200 OK
-INFO:     127.0.0.1:53097 - "POST /api/call-llm-stream HTTP/1.1" 200 OK
-INFO:     127.0.0.1:53097 - "OPTIONS /api/sql-query HTTP/1.1" 200 OK
-INFO:     127.0.0.1:53097 - "POST /api/sql-query HTTP/1.1" 200 OK
-INFO:     Shutting down
-INFO:     Waiting for application shutdown.
-INFO:     Application shutdown complete.
-INFO:     Finished server process [66657]
-INFO:     Stopping reloader process [66654]
+INFO:     127.0.0.1:57543 - "POST /api/call-llm-stream HTTP/1.1" 200 OK
+[LLM-STREAM] input=帮我统计OLT数据 -> intent=OLT_STATISTICS sql_len=573
+INFO:     127.0.0.1:57543 - "POST /api/sql-query HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57686 - "POST /api/call-llm-stream HTTP/1.1" 200 OK
+[INTENT][FTTR] Parsed erji='四川内江隆昌县石燕桥镇大竹村小区5组25号家旁电杆/GF013-POS001' from text
+[LLM-STREAM] input=帮我查询 四川内江隆昌县石燕桥镇大竹村小区5组25号家旁电杆/GF013-POS001 是否可以开通FTTR -> intent=FTTR_CHECK sql_len=485
+INFO:     127.0.0.1:57686 - "POST /api/sql-query HTTP/1.1" 200 OK

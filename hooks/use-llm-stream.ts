@@ -7,6 +7,8 @@ interface StreamResponse {
   thinking: string;
   sql: string;
   isComplete: boolean;
+  // optional intent params from backend
+  params?: Record<string, string>;
 }
 
 interface UseLLMStreamReturn {

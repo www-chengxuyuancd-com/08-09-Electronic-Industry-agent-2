@@ -28,4 +28,26 @@ export const sqlClient = {
     const data = await response.json();
     return { data, success: true };
   },
+  exportQuery: async (
+    sql: string
+  ): Promise<
+    ApiResponse<{
+      fileId: string;
+      filename: string;
+      downloadUrl: string;
+      rowCount: number;
+    }>
+  > => {
+    const response = await fetch(`${BACKEND_URL}/api/sql-query/export`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sql }),
+    });
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.detail || "导出失败");
+    }
+    const data = await response.json();
+    return { data, success: true };
+  },
 };

@@ -6,8 +6,8 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { TablePreview } from "@/components/charts/TablePreview";
-import { ChartVisualization } from "@/components/charts/ChartVisualization";
-import { User, Bot, Copy, Play, BarChart3, Table, Loader2 } from "lucide-react";
+import { User, Bot, Copy, Play, Download, Loader2 } from "lucide-react";
+import { sqlClient } from "@/api-clients/sql-client";
 import { cn } from "@/lib/utils";
 
 interface ChatMessageProps {
@@ -21,7 +21,7 @@ export function ChatMessage({
   onExecuteSQL,
   isExecuting = false,
 }: ChatMessageProps) {
-  const [viewMode, setViewMode] = useState<"chart" | "table">("chart");
+  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [editedSQL, setEditedSQL] = useState(message.sql || "");
   const [isEditing, setIsEditing] = useState(false);
 
@@ -33,7 +33,31 @@ export function ChatMessage({
 
   const handleExecuteSQL = () => {
     if (onExecuteSQL && editedSQL.trim()) {
+      setDownloadUrl(null);
       onExecuteSQL(editedSQL);
+    }
+  };
+
+  const handleDownload = async () => {
+    try {
+      if (!editedSQL.trim()) return;
+      const resp = await sqlClient.exportQuery(editedSQL);
+      if (resp.success && resp.data) {
+        setDownloadUrl(resp.data.downloadUrl);
+        // trigger browser download
+        if (resp.data.downloadUrl) {
+          const a = document.createElement("a");
+          a.href = `${
+            process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000"
+          }${resp.data.downloadUrl}`;
+          a.download = resp.data.filename || "result.xlsx";
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+        }
+      }
+    } catch (e) {
+      console.error("导出失败", e);
     }
   };
 
@@ -175,37 +199,24 @@ export function ChatMessage({
             </Card>
           )}
 
-          {/* 查询结果 */}
+          {/* 查询结果：仅表格 + 下载按钮 */}
           {message.queryResults && message.queryResults.length > 0 && (
             <Card>
               <CardContent className="pt-4">
                 <div className="flex items-center justify-between mb-3">
                   <div className="text-xs text-muted-foreground">查询结果</div>
-                  <div className="flex gap-1">
+                  <div className="flex gap-2">
                     <Button
-                      variant={viewMode === "chart" ? "default" : "outline"}
+                      variant="outline"
                       size="sm"
-                      onClick={() => setViewMode("chart")}
-                      className="h-7 px-2"
+                      onClick={handleDownload}
+                      className="h-7 px-2 gap-1"
                     >
-                      <BarChart3 className="h-3 w-3" />
-                    </Button>
-                    <Button
-                      variant={viewMode === "table" ? "default" : "outline"}
-                      size="sm"
-                      onClick={() => setViewMode("table")}
-                      className="h-7 px-2"
-                    >
-                      <Table className="h-3 w-3" />
+                      <Download className="h-3 w-3" /> 下载Excel
                     </Button>
                   </div>
                 </div>
-
-                {viewMode === "chart" ? (
-                  <ChartVisualization data={message.queryResults} />
-                ) : (
-                  <TablePreview data={message.queryResults} />
-                )}
+                <TablePreview data={message.queryResults} />
               </CardContent>
             </Card>
           )}
