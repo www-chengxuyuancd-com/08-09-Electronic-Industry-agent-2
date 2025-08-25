@@ -47,6 +47,11 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "deepseek")
 
+# LLM HTTP settings
+LLM_HTTP_TIMEOUT_SECONDS = int(os.getenv("LLM_HTTP_TIMEOUT_SECONDS", "30"))
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
+LLM_BACKOFF_BASE = float(os.getenv("LLM_BACKOFF_BASE", "0.8"))
+
 # Database schema (same as from the original TypeScript file)
 DB_SCHEMA = """
 ```sql
@@ -114,6 +119,28 @@ def build_thinking_prompt(user_input: str) -> str:
     )
     return f"{instructions}\n业务背景:\n{SQL_PROMPT}\n用户需求:\n{user_input}"
 
+def build_intent_prompt(user_input: str) -> str:
+    instructions = """
+你是一个意图识别助手。根据用户输入，从以下列表中识别需要执行的任务，并抽取必要的参数。
+- 任务类型: 'OLT_STATISTICS' (OLT统计) 或 'FTTR_CHECK' (FTTR鉴别)。
+- 当识别为 FTTR_CHECK 时，尽量抽取以下参数(若有)：
+  - erjiFenGuang: 二级分光器名称（原文字符串，允许包含中文括号与'/'）
+  - onuMingCheng: ONU用户名称（原文字符串）
+输出严格的 JSON，禁止任何解释或多余文本，结构如下：
+{
+  "tasks": [
+    {"type": "FTTR_CHECK", "params": {"erjiFenGuang": "...", "onuMingCheng": "..."}},
+    {"type": "OLT_STATISTICS", "params": {}}
+  ]
+}
+注意：
+- 保持 tasks 为数组，可包含 0-N 个任务。
+- 字段名必须使用上述英文字段。
+- 参数缺失时用空对象或省略该字段。
+- 若文本显式提到 ONU 名称（常和"ONU用户"或 ONU 一起出现且带引号），优先填写 onuMingCheng。
+"""
+    return f"{instructions}\n用户输入:\n{user_input}\n只输出JSON："
+
 # Global database connection pool
 db_pool: Optional[asyncpg.Pool] = None
 
@@ -161,9 +188,16 @@ class LLMRequest(BaseModel):
 
 class SQLQueryRequest(BaseModel):
     sql: str = Field(..., description="SQL query to execute")
+    # Optional entity hints to enrich empty-state UX
+    entityType: Optional[str] = Field(default=None, description="Entity type, e.g., 'ONU' or '分光器'")
+    entityName: Optional[str] = Field(default=None, description="Entity name extracted from user input")
 
 class LLMStreamRequest(BaseModel):
     userInput: str = Field(..., description="User input for streaming LLM")
+
+class IntentLLMRequest(BaseModel):
+    text: str
+    provider: Optional[str] = None
 
 class ErrorResponse(BaseModel):
     success: bool = False
@@ -194,6 +228,7 @@ class FTTRCheckRequest(BaseModel):
     onuMingCheng: Optional[str] = Field(default=None, description="ONU名称")
 
 class FTTRCheckResponse(BaseModel):
+    rows: List[Dict[str, Any]]
     preview: List[Dict[str, Any]]
     fileId: str
     filename: str
@@ -324,22 +359,51 @@ def recognize_task_from_text(text: str) -> str:
     return "UNKNOWN"
 
 def extract_erji_fenguang_name(text: str) -> Optional[str]:
-    """Best-effort extraction of 二级分光器名称 from free text.
-    Heuristics:
-    - Prefer substring containing '/'
-    - Otherwise try text between keywords like 查询/判断 and 能否/是否/能开通/FTTR
+    """Extract 二级分光器名称 from free text.
+    Improvements:
+    - Support quoted names (single/double and Chinese quotes)
+    - Allow full-width parentheses and more punctuation before '/'
+    - Fall back to previous heuristics
     """
     if not text:
         return None
-    # 1) Look for token containing '/'
-    m = re.search(r'([\u4e00-\u9fffA-Za-z0-9_-]+/[A-Za-z0-9_-]+)', text)
+    t = text.strip()
+    # Normalize Chinese quotes to ASCII quotes for easier matching
+    t = t.replace(""", '"').replace(""", '"').replace("'", "'").replace("'", "'")
+    # 1) Prefer content inside quotes that contains a '/'
+    m_quote = re.search(r"""["']([^"'\n\r]+/[^"'\n\r]+)["']""", t)
+    if m_quote:
+        return m_quote.group(1).strip()
+    # 2) Look for token containing '/' allowing Chinese full-width parentheses
+    m = re.search(r'([\u4e00-\u9fffA-Za-z0-9_\-（）()·]+/[A-Za-z0-9_\-]+)', t)
     if m:
-        return m.group(1)
-    # 2) Between verbs and question
-    m2 = re.search(r'(?:查询|判断|鉴别|查看|请帮我|请帮忙)([\u4e00-\u9fffA-Za-z0-9_\-]+)/?(?:能否|是否|能开通|能不能|可否|开通)?', text)
+        return m.group(1).strip()
+    # 3) Between keywords and decision words
+    m2 = re.search(r"""(?:查询|判断|鉴别|查看|请帮我|请帮忙|二级分光器)\s*["']?(.+?)["']?\s*(?:能否|是否|能开通|能不能|可否|开通|fttr|FTTR)""", t)
     if m2:
         candidate = m2.group(1).strip()
         return candidate if candidate else None
+    return None
+
+def extract_onu_name(text: str) -> Optional[str]:
+    """Extract ONU用户名称 from free text.
+    - Prefer names inside quotes near keywords like ONU/ONU用户
+    - Support Chinese quotes and punctuation
+    """
+    if not text:
+        return None
+    t = text.strip()
+    # Normalize quotes
+    t = t.replace(""", '"').replace(""", '"').replace("'", "'").replace("'", "'")
+    # 1) ONU用户 'xxx' or "xxx"
+    m1 = re.search(r"""(?:ONU用户|onu用户|ONU|onu)\s*["']([^"'\n\r]+)["']""", t)
+    if m1:
+        return m1.group(1).strip()
+    # 2) Generic quoted content when text mentions onu/ONU
+    if re.search(r"\bonu\b", t, flags=re.IGNORECASE):
+        m2 = re.search(r"""["']([^"'\n\r]+)["']""", t)
+        if m2:
+            return m2.group(1).strip()
     return None
 
 OLT_SQL_TEMPLATE = (
@@ -366,9 +430,18 @@ OLT_SQL_TEMPLATE = (
 )
 
 FTTR_FGQ_SQL_TEMPLATE = (
-    "select A.fen_guang_qi_ming_cheng as erji_fen_guang, A.fen_guang_qi_ji_bie, B.fen_guang_qi_ming_cheng as yiji_fen_guang, A.shang_lian_she_bei_zhu_yong_duan_kou, A.shang_lian_she_bei_zhu_yong_duan_kou ~ 'CG' as support_open_FTTR  from \"zi_guan_-_fen_guang_qi_763b860d\" A\n"
+    "select A.fen_guang_qi_ming_cheng as erji_fen_guang,\n"
+    "       A.fen_guang_qi_ji_bie,\n"
+    "       B.fen_guang_qi_ming_cheng as yiji_fen_guang,\n"
+    "       B.shang_lian_she_bei as OLT_mingcheng,\n"
+    "       B.shang_lian_she_bei_zhu_yong_duan_kou as OLT_PON_kou,\n"
+    "       E.suo_shu_ji_fang_zi_yuan_dian as jifang,\n"
+    "       A.shang_lian_she_bei_zhu_yong_duan_kou,\n"
+    "       A.shang_lian_she_bei_zhu_yong_duan_kou ~ 'CG' as support_open_FTTR\n"
+    "from \"zi_guan_-_fen_guang_qi_763b860d\" A\n"
     "left join \"zi_guan_-_fen_guang_qi_763b860d\" B\n"
     "    on B.fen_guang_qi_ming_cheng = A.shang_lian_fen_guang_qi\n"
+    "left join \"zi_guan_-_olt_68131c82\" E on E.olt_ming_cheng = B.shang_lian_she_bei\n"
     "where A.fen_guang_qi_ji_bie = '二级分光'"
 )
 
@@ -377,6 +450,9 @@ FTTR_ONU_SQL_TEMPLATE = (
     "       A.fen_guang_qi_ming_cheng as erji_fen_guang,\n"
     "       A.fen_guang_qi_ji_bie,\n"
     "       B.fen_guang_qi_ming_cheng as yiji_fen_guang,\n"
+    "       B.shang_lian_she_bei as OLT_mingcheng,\n"
+    "       B.shang_lian_she_bei_zhu_yong_duan_kou as OLT_PON_kou,\n"
+    "       E.suo_shu_ji_fang_zi_yuan_dian as jifang,\n"
     "       A.shang_lian_she_bei_zhu_yong_duan_kou,\n"
     "       A.shang_lian_she_bei_zhu_yong_duan_kou ~ 'CG' as fenguangqi_support_open_FTTR,\n"
     "       C.zhong_duan_lei_xing,\n"
@@ -386,30 +462,48 @@ FTTR_ONU_SQL_TEMPLATE = (
     "left join     \"zi_guan_-_fen_guang_qi_763b860d\" A on A.fen_guang_qi_ming_cheng = D.jie_ru_she_bei_ming_cheng\n"
     "left join \"zi_guan_-_fen_guang_qi_763b860d\" B\n"
     "    on B.fen_guang_qi_ming_cheng = A.shang_lian_fen_guang_qi\n"
+    "left join \"zi_guan_-_olt_68131c82\" E on E.olt_ming_cheng = B.shang_lian_she_bei\n"
     "where A.fen_guang_qi_ji_bie = '二级分光'\n"
-    "-- and A.fen_guang_qi_ming_cheng is null"
+    "  and C.yun_xing_zhuang_tai = '在线'\n"
 )
 
-def build_sql_for_intent(text: str) -> Dict[str, Any]:
-    task = recognize_task_from_text(text)
-    if task == "OLT_STATISTICS":
-        return {"task": task, "sql": OLT_SQL_TEMPLATE}
-    if task == "FTTR_CHECK":
-        erji = extract_erji_fenguang_name(text)
+async def build_sql_for_intent(text: str, provider: Optional[str] = None) -> Dict[str, Any]:
+    """Use LLM to recognize intent and build default SQL template for preview/stream."""
+    llm_res = await recognize_intent_via_llm(text, provider)
+    tasks = llm_res.get("tasks", [])
+    # Choose first task for SQL template preview
+    if not tasks:
+        return {"task": "UNKNOWN", "sql": "", "message": "未识别到任务"}
+    task_type = tasks[0].get("type")
+    params = tasks[0].get("params", {})
+    if task_type == "OLT_STATISTICS":
+        return {"task": task_type, "sql": OLT_SQL_TEMPLATE, "params": params}
+    if task_type == "FTTR_CHECK":
+        onu_name = params.get("onuMingCheng")
+        erji = params.get("erjiFenGuang")
+        if onu_name:
+            sql = FTTR_ONU_SQL_TEMPLATE + " and C.onu_ming_cheng = '" + str(onu_name).replace("'", "''") + "'"
+            return {"task": task_type, "sql": sql, "params": params}
         if erji:
-            # Escape single quotes for SQL literal safety
-            erji_escaped = erji.replace("'", "''")
+            erji_escaped = str(erji).replace("'", "''")
             sql = (
-                "select A.fen_guang_qi_ming_cheng as erji_fen_guang, A.fen_guang_qi_ji_bie, B.fen_guang_qi_ming_cheng as yiji_fen_guang, A.shang_lian_she_bei_zhu_yong_duan_kou, A.shang_lian_she_bei_zhu_yong_duan_kou ~ 'CG' as support_open_FTTR  from \"zi_guan_-_fen_guang_qi_763b860d\" A\n"
+                "select A.fen_guang_qi_ming_cheng as erji_fen_guang,\n"
+                "       A.fen_guang_qi_ji_bie,\n"
+                "       B.fen_guang_qi_ming_cheng as yiji_fen_guang,\n"
+                "       B.shang_lian_she_bei as OLT_mingcheng,\n"
+                "       B.shang_lian_she_bei_zhu_yong_duan_kou as OLT_PON_kou,\n"
+                "       E.suo_shu_ji_fang_zi_yuan_dian as jifang,\n"
+                "       A.shang_lian_she_bei_zhu_yong_duan_kou,\n"
+                "       A.shang_lian_she_bei_zhu_yong_duan_kou ~ 'CG' as support_open_FTTR  \n"
+                "from \"zi_guan_-_fen_guang_qi_763b860d\" A\n"
                 "left join \"zi_guan_-_fen_guang_qi_763b860d\" B\n"
                 "    on B.fen_guang_qi_ming_cheng = A.shang_lian_fen_guang_qi\n"
+                "left join \"zi_guan_-_olt_68131c82\" E on E.olt_ming_cheng = B.shang_lian_she_bei\n"
                 "where A.fen_guang_qi_ji_bie = '二级分光'\n"
                 f"and A.fen_guang_qi_ming_cheng = '{erji_escaped}'"
             )
-            print(f"[INTENT][FTTR] Parsed erji='{erji}' from text")
-            return {"task": task, "sql": sql, "params": {"erjiFenGuang": erji}}
-        # Default to 二级分光器版本。ONU版本可根据需要切换
-        return {"task": task, "sql": FTTR_FGQ_SQL_TEMPLATE, "alternative": FTTR_ONU_SQL_TEMPLATE}
+            return {"task": task_type, "sql": sql, "params": params}
+        return {"task": task_type, "sql": FTTR_FGQ_SQL_TEMPLATE, "params": params, "alternative": FTTR_ONU_SQL_TEMPLATE}
     return {"task": "UNKNOWN", "sql": "", "message": "未识别到任务"}
 
 def get_storage_dir() -> str:
@@ -865,30 +959,44 @@ class OpenAIClient:
             raise ValueError("未配置OpenAI API密钥。请在环境变量中设置OPENAI_API_KEY。")
     
     async def generate(self, prompt: str) -> str:
-        """Generate response from OpenAI API"""
-        async with httpx.AsyncClient() as client:
+        """Generate response from OpenAI API with timeout and retries."""
+        timeout = httpx.Timeout(LLM_HTTP_TIMEOUT_SECONDS)
+        for attempt in range(LLM_MAX_RETRIES + 1):
             try:
-                response = await client.post(
-                    OPENAI_API_ENDPOINT,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {OPENAI_API_KEY}"
-                    },
-                    json={
-                        "model": OPENAI_MODEL,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.1
-                    }
-                )
-                response.raise_for_status()
-                data = response.json()
-                return data["choices"][0]["message"]["content"].strip()
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    response = await client.post(
+                        OPENAI_API_ENDPOINT,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {OPENAI_API_KEY}"
+                        },
+                        json={
+                            "model": OPENAI_MODEL,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "temperature": 0.1
+                        }
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    return data["choices"][0]["message"]["content"].strip()
+            except (httpx.ReadTimeout, httpx.ConnectTimeout):
+                if attempt < LLM_MAX_RETRIES:
+                    await asyncio.sleep(LLM_BACKOFF_BASE * (2 ** attempt))
+                    continue
+                raise HTTPException(status_code=500, detail="OpenAI API Error: Timeout")
+            except httpx.HTTPStatusError as he:
+                status = he.response.status_code if he.response else ""
+                body = (he.response.text if he.response else "")[:500]
+                raise HTTPException(status_code=500, detail=f"OpenAI API Error: status={status}, body={body}")
+            except httpx.RequestError as re_err:
+                raise HTTPException(status_code=500, detail=f"OpenAI API Error: {re_err.__class__.__name__}: {str(re_err)}")
             except Exception as e:
-                raise HTTPException(status_code=500, detail=f"OpenAI API Error: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"OpenAI API Error: {e.__class__.__name__}: {str(e)}")
     
     async def generate_stream(self, prompt: str) -> AsyncGenerator[str, None]:
         """Generate streaming response from OpenAI API"""
-        async with httpx.AsyncClient() as client:
+        timeout = httpx.Timeout(LLM_HTTP_TIMEOUT_SECONDS)
+        async with httpx.AsyncClient(timeout=timeout) as client:
             try:
                 async with client.stream(
                     "POST",
@@ -926,7 +1034,15 @@ class OpenAIClient:
                                 except json.JSONDecodeError:
                                     continue
             except Exception as e:
-                raise HTTPException(status_code=500, detail=f"OpenAI API Error: {str(e)}")
+                # Streaming errors
+                if isinstance(e, httpx.HTTPStatusError):
+                    he = e
+                    status = he.response.status_code if he.response else ""
+                    body = (he.response.text if he.response else "")[:500]
+                    raise HTTPException(status_code=500, detail=f"OpenAI API Error: status={status}, body={body}")
+                if isinstance(e, httpx.RequestError):
+                    raise HTTPException(status_code=500, detail=f"OpenAI API Error: {e.__class__.__name__}: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"OpenAI API Error: {e.__class__.__name__}: {str(e)}")
 
 class GeminiClient:
     """Gemini API client"""
@@ -936,22 +1052,35 @@ class GeminiClient:
             raise ValueError("未配置Gemini API密钥。请在环境变量中设置GEMINI_API_KEY。")
     
     async def generate(self, prompt: str) -> str:
-        """Generate response from Gemini API"""
-        async with httpx.AsyncClient() as client:
+        """Generate response from Gemini API with timeout and retries."""
+        timeout = httpx.Timeout(LLM_HTTP_TIMEOUT_SECONDS)
+        for attempt in range(LLM_MAX_RETRIES + 1):
             try:
-                response = await client.post(
-                    f"{GEMINI_ENDPOINT}?key={GEMINI_API_KEY}",
-                    headers={"Content-Type": "application/json"},
-                    json={
-                        "contents": [{"parts": [{"text": prompt}]}],
-                        "generationConfig": {"temperature": 0.1}
-                    }
-                )
-                response.raise_for_status()
-                data = response.json()
-                return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    response = await client.post(
+                        f"{GEMINI_ENDPOINT}?key={GEMINI_API_KEY}",
+                        headers={"Content-Type": "application/json"},
+                        json={
+                            "contents": [{"parts": [{"text": prompt}]}],
+                            "generationConfig": {"temperature": 0.1}
+                        }
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            except (httpx.ReadTimeout, httpx.ConnectTimeout):
+                if attempt < LLM_MAX_RETRIES:
+                    await asyncio.sleep(LLM_BACKOFF_BASE * (2 ** attempt))
+                    continue
+                raise HTTPException(status_code=500, detail="Gemini API Error: Timeout")
+            except httpx.HTTPStatusError as he:
+                status = he.response.status_code if he.response else ""
+                body = (he.response.text if he.response else "")[:500]
+                raise HTTPException(status_code=500, detail=f"Gemini API Error: status={status}, body={body}")
+            except httpx.RequestError as re_err:
+                raise HTTPException(status_code=500, detail=f"Gemini API Error: {re_err.__class__.__name__}: {str(re_err)}")
             except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Gemini API Error: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"Gemini API Error: {e.__class__.__name__}: {str(e)}")
     
     async def generate_stream(self, prompt: str) -> AsyncGenerator[str, None]:
         """Generate streaming response from Gemini API (simulated)"""
@@ -972,28 +1101,42 @@ class DeepSeekClient:
             raise ValueError("未配置DeepSeek API密钥。请在环境变量中设置DEEPSEEK_API_KEY。")
     
     async def generate(self, prompt: str) -> str:
-        async with httpx.AsyncClient() as client:
+        timeout = httpx.Timeout(LLM_HTTP_TIMEOUT_SECONDS)
+        for attempt in range(LLM_MAX_RETRIES + 1):
             try:
-                response = await client.post(
-                    DEEPSEEK_API_ENDPOINT,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {DEEPSEEK_API_KEY}"
-                    },
-                    json={
-                        "model": DEEPSEEK_MODEL,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.1
-                    }
-                )
-                response.raise_for_status()
-                data = response.json()
-                return data["choices"][0]["message"]["content"].strip()
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    response = await client.post(
+                        DEEPSEEK_API_ENDPOINT,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {DEEPSEEK_API_KEY}"
+                        },
+                        json={
+                            "model": DEEPSEEK_MODEL,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "temperature": 0.1
+                        }
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    return data["choices"][0]["message"]["content"].strip()
+            except (httpx.ReadTimeout, httpx.ConnectTimeout):
+                if attempt < LLM_MAX_RETRIES:
+                    await asyncio.sleep(LLM_BACKOFF_BASE * (2 ** attempt))
+                    continue
+                raise HTTPException(status_code=500, detail="DeepSeek API Error: Timeout")
+            except httpx.HTTPStatusError as he:
+                status = he.response.status_code if he.response else ""
+                body = (he.response.text if he.response else "")[:500]
+                raise HTTPException(status_code=500, detail=f"DeepSeek API Error: status={status}, body={body}")
+            except httpx.RequestError as re_err:
+                raise HTTPException(status_code=500, detail=f"DeepSeek API Error: {re_err.__class__.__name__}: {str(re_err)}")
             except Exception as e:
-                raise HTTPException(status_code=500, detail=f"DeepSeek API Error: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"DeepSeek API Error: {e.__class__.__name__}: {str(e)}")
     
     async def generate_stream(self, prompt: str) -> AsyncGenerator[str, None]:
-        async with httpx.AsyncClient() as client:
+        timeout = httpx.Timeout(LLM_HTTP_TIMEOUT_SECONDS)
+        async with httpx.AsyncClient(timeout=timeout) as client:
             try:
                 async with client.stream(
                     "POST",
@@ -1030,9 +1173,52 @@ class DeepSeekClient:
                                 except json.JSONDecodeError:
                                     continue
             except Exception as e:
-                raise HTTPException(status_code=500, detail=f"DeepSeek API Error: {str(e)}")
+                if isinstance(e, httpx.HTTPStatusError):
+                    he = e
+                    status = he.response.status_code if he.response else ""
+                    body = (he.response.text if he.response else "")[:500]
+                    raise HTTPException(status_code=500, detail=f"DeepSeek API Error: status={status}, body={body}")
+                if isinstance(e, httpx.RequestError):
+                    raise HTTPException(status_code=500, detail=f"DeepSeek API Error: {e.__class__.__name__}: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"DeepSeek API Error: {e.__class__.__name__}: {str(e)}")
 
 # API endpoints
+def get_llm_client(provider: Optional[str] = None):
+    name = (provider or LLM_PROVIDER or "deepseek").lower()
+    if name == "openai":
+        return OpenAIClient()
+    if name == "gemini":
+        return GeminiClient()
+    return DeepSeekClient()
+
+async def recognize_intent_via_llm(text: str, provider: Optional[str] = None) -> Dict[str, Any]:
+    client = get_llm_client(provider)
+    prompt = build_intent_prompt(text)
+    content = await client.generate(prompt)
+    try:
+        # Some models may wrap code fences; strip if present
+        cleaned = content.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r'^```(json|JSON)?\n?', '', cleaned)
+            cleaned = re.sub(r'\n?```$', '', cleaned)
+        data = json.loads(cleaned)
+        if not isinstance(data, dict):
+            raise ValueError("LLM输出不是JSON对象")
+        tasks = data.get("tasks", [])
+        if not isinstance(tasks, list):
+            tasks = []
+        # Normalize
+        norm_tasks: List[Dict[str, Any]] = []
+        for t in tasks:
+            ttype = (t or {}).get("type")
+            params = (t or {}).get("params") or {}
+            if ttype in ("OLT_STATISTICS", "FTTR_CHECK"):
+                norm_tasks.append({"type": ttype, "params": params})
+        return {"tasks": norm_tasks}
+    except Exception as e:
+        # Fallback: no tasks
+        return {"tasks": []}
+
 @app.get("/")
 async def root():
     """Root endpoint"""
@@ -1044,11 +1230,14 @@ async def call_llm(request: LLMRequest):
     try:
         if not request.userInput:
             raise HTTPException(status_code=400, detail="缺少用户输入")
-        intent_sql = build_sql_for_intent(request.userInput)
+        intent_sql = await build_sql_for_intent(request.userInput, request.modelType)
         print(f"[LLM] input={request.userInput} -> intent={intent_sql.get('task')} sql_len={len(intent_sql.get('sql', ''))}")
         return {"sql": intent_sql.get("sql", "")}
+    except HTTPException:
+        # Preserve detailed upstream error
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM处理错误: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"LLM处理错误: {e.__class__.__name__}: {str(e)}")
 
 @app.post("/api/call-llm-stream")
 async def call_llm_stream(request: LLMStreamRequest):
@@ -1060,7 +1249,7 @@ async def call_llm_stream(request: LLMStreamRequest):
                 yield f"data: {json.dumps({'error': '缺少用户输入'}, ensure_ascii=False)}\n\n"
                 return
 
-            intent_sql = build_sql_for_intent(request.userInput)
+            intent_sql = await build_sql_for_intent(request.userInput)
             task = intent_sql.get("task")
             sql_text = intent_sql.get("sql", "")
             print(f"[LLM-STREAM] input={request.userInput} -> intent={task} sql_len={len(sql_text)}")
@@ -1080,8 +1269,13 @@ async def call_llm_stream(request: LLMStreamRequest):
             # Completion
             yield f"data: {json.dumps({'thinking': thinking_part, 'sql': sql_text, 'isComplete': True, 'params': params}, ensure_ascii=False)}\n\n"
 
+        except HTTPException as he:
+            # Surface detailed upstream error
+            error_data = {"error": he.detail}
+            yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
         except Exception as e:
-            error_data = {"error": str(e)}
+            # Generic error with type
+            error_data = {"error": f"{e.__class__.__name__}: {str(e)}"}
             yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
@@ -1095,23 +1289,39 @@ async def call_llm_stream(request: LLMStreamRequest):
 
 @app.post("/api/intent/recognize", response_model=IntentResponse)
 async def recognize_intent(request: IntentRequest):
-    """Simple rule-based intent recognition for OLT统计 and FTTR鉴别."""
-    text = (request.text or "").strip().lower()
+    """LLM-based intent recognition for OLT统计 and FTTR鉴别."""
+    text = (request.text or "").strip()
+    llm_res = await recognize_intent_via_llm(text)
+    tasks_data = llm_res.get("tasks", [])
     tasks: List[IntentTask] = []
-    # OLT统计: keywords
-    if ("olt" in text) and ("统计" in request.text or "低效" in request.text or "数量" in request.text or "数" in request.text):
-        tasks.append(IntentTask(type="OLT_STATISTICS", params={}))
-    # FTTR鉴别
-    if ("fttr" in text) or ("分光" in request.text) or ("二级分光" in request.text) or ("onu" in text):
-        params: Dict[str, Any] = {}
-        erji = extract_erji_fenguang_name(request.text)
-        if erji:
-            params["erjiFenGuang"] = erji
-        tasks.append(IntentTask(type="FTTR_CHECK", params=params))
+    for t in tasks_data:
+        tasks.append(IntentTask(type=t.get("type", "UNKNOWN"), params=t.get("params", {})))
     if not tasks:
-        # default: try both, frontend can choose
         tasks = [IntentTask(type="OLT_STATISTICS", params={}), IntentTask(type="FTTR_CHECK", params={})]
     return {"tasks": tasks}
+
+@app.post("/api/intent/execute")
+async def execute_intent(request: IntentRequest):
+    """Execute intent end-to-end: use LLM for intent, then run the appropriate task.
+    Returns full task result so FTTR (ONU) will include the step-2 aggregation when needed.
+    """
+    text = (request.text or "").strip()
+    llm_res = await recognize_intent_via_llm(text)
+    tasks = llm_res.get("tasks", [])
+    if not tasks:
+        raise HTTPException(status_code=400, detail="未识别到任务")
+    first = tasks[0]
+    ttype = first.get("type")
+    params = first.get("params", {})
+    if ttype == "FTTR_CHECK":
+        req = FTTRCheckRequest(
+            erjiFenGuang=params.get("erjiFenGuang"),
+            onuMingCheng=params.get("onuMingCheng"),
+        )
+        return await task_fttr_check(req)
+    if ttype == "OLT_STATISTICS":
+        return await task_olt_statistics()
+    raise HTTPException(status_code=400, detail="未识别到可执行的任务类型")
 
 @app.post("/api/sql-query")
 async def execute_sql_query(request: SQLQueryRequest):
@@ -1145,8 +1355,93 @@ async def execute_sql_query(request: SQLQueryRequest):
                 for row in result:
                     row_dict = dict(row)
                     data.append(serialize_db_result(row_dict))
-                
-                return data
+
+                # Try to infer entity meta if not provided in request
+                entity_type = request.entityType
+                entity_name = request.entityName
+                try:
+                    lowered = cleaned_sql.lower()
+                    if not entity_type:
+                        if ("onu" in lowered) or ("光猫" in cleaned_sql):
+                            entity_type = "ONU"
+                        elif ("fen_guang_qi" in lowered) or ("分光器" in cleaned_sql):
+                            entity_type = "分光器"
+                    if not entity_name:
+                        # Extract all quoted literals and choose the most likely candidate
+                        candidates: list[str] = []
+                        candidates += [m.strip() for m in re.findall(r"'(.*?)'", cleaned_sql)]
+                        candidates += [m.strip() for m in re.findall(r"“(.*?)”", cleaned_sql)]
+                        candidates += [m.strip() for m in re.findall(r"「(.*?)」", cleaned_sql)]
+                        # Prefer those containing 'ONU' (case-insensitive), otherwise the longest one
+                        best = None
+                        for s in candidates:
+                            if not best:
+                                best = s
+                                continue
+                            if ("onu" in s.lower()) and ("onu" not in best.lower()):
+                                best = s
+                                continue
+                            if len(s) > len(best):
+                                best = s
+                        if best:
+                            entity_name = best
+                except Exception:
+                    pass
+
+                # Optional: if ONU case has no support, compute same-room recommendations
+                recommendations: List[Dict[str, Any]] = []
+                try:
+                    def _support_flag_js(rec: Dict[str, Any]) -> bool:
+                        return bool(rec.get("fenguangqi_support_open_FTTR") or rec.get("fenguangqi_support_open_fttr") or rec.get("support_open_FTTR") or rec.get("support_open_fttr"))
+
+                    if entity_type == "ONU" and data:
+                        any_support = any(_support_flag_js(r) for r in data)
+                        first = data[0]
+                        jifang_val = first.get("jifang") if isinstance(first, dict) else None
+                        if (not any_support) and jifang_val:
+                            sql_step2 = (
+                                "select\n"
+                                "    A.fen_guang_qi_ming_cheng as erji_fen_guang,\n"
+                                "    COUNT(C.onu_ming_cheng) as onu_count,\n"
+                                "    A.fen_guang_qi_ji_bie,\n"
+                                "    B.fen_guang_qi_ming_cheng as yiji_fen_guang,\n"
+                                "    B.shang_lian_she_bei as OLT_mingcheng,\n"
+                                "    B.shang_lian_she_bei_zhu_yong_duan_kou as OLT_PON_kou,\n"
+                                "    E.suo_shu_ji_fang_zi_yuan_dian as jifang,\n"
+                                "    A.shang_lian_she_bei_zhu_yong_duan_kou,\n"
+                                "    A.shang_lian_she_bei_zhu_yong_duan_kou ~ 'CG' as fenguangqi_support_open_FTTR,\n"
+                                "    STRING_AGG(C.zhong_duan_lei_xing, ', ') as zhong_duan_lei_xing_list,\n"
+                                "    BOOL_OR(C.zhong_duan_lei_xing in ('V176-20', 'HN8145XR', 'HG3142F', 'ZXHN G7611 V2', 'V175', 'V173', 'UNF130Z')) as has_single_ONU_support_fttr\n\n"
+                                "from \"yue_ri_wang_guan_onu_zai_xian_qing_dan_4f929071\" C\n"
+                                "join \"zi_guan_-_onu_guang_mao_yong_hu_d88a2209\" D on C.onu_ming_cheng = D.xin_zeng_onu\n"
+                                "left join \"zi_guan_-_fen_guang_qi_763b860d\" A on A.fen_guang_qi_ming_cheng = D.jie_ru_she_bei_ming_cheng\n"
+                                "left join \"zi_guan_-_fen_guang_qi_763b860d\" B\n"
+                                "    on B.fen_guang_qi_ming_cheng = A.shang_lian_fen_guang_qi\n"
+                                "left join \"zi_guan_-_olt_68131c82\" E on E.olt_ming_cheng = B.shang_lian_she_bei\n"
+                                "where A.fen_guang_qi_ji_bie = '二级分光'\n"
+                                "  and E.suo_shu_ji_fang_zi_yuan_dian = $1 and (A.shang_lian_she_bei_zhu_yong_duan_kou ~ 'CG') and C.zhong_duan_lei_xing not in ('V176-20', 'HN8145XR', 'HG3142F', 'ZXHN G7611 V2', 'V175', 'V173', 'UNF130Z')\n"
+                                "  and C.yun_xing_zhuang_tai = '在线'\n"
+                                "GROUP BY\n"
+                                "    A.fen_guang_qi_ming_cheng,\n"
+                                "    A.fen_guang_qi_ji_bie,\n"
+                                "    B.fen_guang_qi_ming_cheng,\n"
+                                "    B.shang_lian_she_bei,\n"
+                                "    B.shang_lian_she_bei_zhu_yong_duan_kou,\n"
+                                "    E.suo_shu_ji_fang_zi_yuan_dian,\n"
+                                "    A.shang_lian_she_bei_zhu_yong_duan_kou\n"
+                                "ORDER BY onu_count DESC;\n"
+                            )
+                            recommendations = await execute_query_dicts(sql_step2, [jifang_val])
+                except Exception:
+                    pass
+
+                # Return enriched response while keeping compatibility by nesting rows under 'data'
+                return {
+                    "data": data,
+                    "entityType": entity_type,
+                    "entityName": entity_name,
+                    "recommendations": recommendations,
+                }
             
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"SQL查询错误: {str(e)}")
@@ -1214,38 +1509,144 @@ async def task_fttr_check(request: FTTRCheckRequest):
         raise HTTPException(status_code=400, detail="请提供二级分光器名称或ONU名称")
 
     if onu:
-        sql = (
+        # Step 2.1: 查询ONU用户对应的二级分光器（含机房/OLT信息与在线过滤）
+        sql_step1 = (
             "select C.onu_ming_cheng,\n"
             "       A.fen_guang_qi_ming_cheng as erji_fen_guang,\n"
             "       A.fen_guang_qi_ji_bie,\n"
             "       B.fen_guang_qi_ming_cheng as yiji_fen_guang,\n"
+            "       B.shang_lian_she_bei as OLT_mingcheng,\n"
+            "       B.shang_lian_she_bei_zhu_yong_duan_kou as OLT_PON_kou,\n"
+            "       E.suo_shu_ji_fang_zi_yuan_dian as jifang,\n"
             "       A.shang_lian_she_bei_zhu_yong_duan_kou,\n"
             "       A.shang_lian_she_bei_zhu_yong_duan_kou ~ 'CG' as fenguangqi_support_open_FTTR,\n"
             "       C.zhong_duan_lei_xing,\n"
-            "       C.zhong_duan_lei_xing in ('V176-20', 'HN8145XR', 'HG3142F', 'ZXHN G7611 V2', 'V175', 'V173', 'UNF130Z') as single_ONU_support_fttr\n"
+            "       C.zhong_duan_lei_xing in ('V176-20', 'HN8145XR', 'HG3142F', 'ZXHN G7611 V2', 'V175', 'V173', 'UNF130Z') as single_ONU_support_fttr\n\n"
             "from  \"yue_ri_wang_guan_onu_zai_xian_qing_dan_4f929071\" C\n"
             "join \"zi_guan_-_onu_guang_mao_yong_hu_d88a2209\" D on C.onu_ming_cheng = D.xin_zeng_onu\n"
             "left join     \"zi_guan_-_fen_guang_qi_763b860d\" A on A.fen_guang_qi_ming_cheng = D.jie_ru_she_bei_ming_cheng\n"
-            "left join \"zi_guan_-_fen_guang_qi_763b860d\" B on B.fen_guang_qi_ming_cheng = A.shang_lian_fen_guang_qi\n"
-            "where A.fen_guang_qi_ji_bie = '二级分光' and C.onu_ming_cheng = $1\n"
+            "left join \"zi_guan_-_fen_guang_qi_763b860d\" B\n"
+            "    on B.fen_guang_qi_ming_cheng = A.shang_lian_fen_guang_qi\n"
+            "left join \"zi_guan_-_olt_68131c82\" E on E.olt_ming_cheng = B.shang_lian_she_bei\n"
+            "where A.fen_guang_qi_ji_bie = '二级分光' and C.yun_xing_zhuang_tai = '在线' and C.onu_ming_cheng = $1\n"
         )
-        print(f"[TASK][FTTR][ONU] onu={onu} executing SQL")
-        rows = await execute_query_dicts(sql, [onu])
-        base_name = f"FTTR鉴别_ONU_{onu}"
+        print(f"[TASK][FTTR][ONU] step1 onu={onu} executing SQL")
+        rows_step1 = await execute_query_dicts(sql_step1, [onu])
+        # If 二级分光器支持CG口，直接返回step1结果
+        def _support_flag(rec: Dict[str, Any]) -> bool:
+            return bool(rec.get("fenguangqi_support_open_FTTR")) or bool(rec.get("fenguangqi_support_open_fttr"))
+        if rows_step1 and any(_support_flag(r) for r in rows_step1):
+            rows = rows_step1
+            base_name = f"FTTR鉴别_ONU_{onu}"
+        else:
+            # Step 2.2: 使用机房作为输入，查询同机房内满足条件的二级分光器聚合信息
+            if not rows_step1 or not rows_step1[0].get("jifang"):
+                # No jifang info; return step1 as fallback
+                rows = rows_step1
+                base_name = f"FTTR鉴别_ONU_{onu}"
+            else:
+                jifang = rows_step1[0]["jifang"]
+                sql_step2 = (
+                    "select\n"
+                    "    A.fen_guang_qi_ming_cheng as erji_fen_guang,\n"
+                    "    COUNT(C.onu_ming_cheng) as onu_count,\n"
+                    "    A.fen_guang_qi_ji_bie,\n"
+                    "    B.fen_guang_qi_ming_cheng as yiji_fen_guang,\n"
+                    "    B.shang_lian_she_bei as OLT_mingcheng,\n"
+                    "    B.shang_lian_she_bei_zhu_yong_duan_kou as OLT_PON_kou,\n"
+                    "    E.suo_shu_ji_fang_zi_yuan_dian as jifang,\n"
+                    "    A.shang_lian_she_bei_zhu_yong_duan_kou,\n"
+                    "    A.shang_lian_she_bei_zhu_yong_duan_kou ~ 'CG' as fenguangqi_support_open_FTTR,\n"
+                    "    STRING_AGG(C.zhong_duan_lei_xing, ', ') as zhong_duan_lei_xing_list,\n"
+                    "    BOOL_OR(C.zhong_duan_lei_xing in ('V176-20', 'HN8145XR', 'HG3142F', 'ZXHN G7611 V2', 'V175', 'V173', 'UNF130Z')) as has_single_ONU_support_fttr\n\n"
+                    "from \"yue_ri_wang_guan_onu_zai_xian_qing_dan_4f929071\" C\n"
+                    "join \"zi_guan_-_onu_guang_mao_yong_hu_d88a2209\" D on C.onu_ming_cheng = D.xin_zeng_onu\n"
+                    "left join \"zi_guan_-_fen_guang_qi_763b860d\" A on A.fen_guang_qi_ming_cheng = D.jie_ru_she_bei_ming_cheng\n"
+                    "left join \"zi_guan_-_fen_guang_qi_763b860d\" B\n"
+                    "    on B.fen_guang_qi_ming_cheng = A.shang_lian_fen_guang_qi\n"
+                    "left join \"zi_guan_-_olt_68131c82\" E on E.olt_ming_cheng = B.shang_lian_she_bei\n"
+                    "where A.fen_guang_qi_ji_bie = '二级分光'\n"
+                    "  and E.suo_shu_ji_fang_zi_yuan_dian = $1 and (A.shang_lian_she_bei_zhu_yong_duan_kou ~ 'CG') and C.zhong_duan_lei_xing not in ('V176-20', 'HN8145XR', 'HG3142F', 'ZXHN G7611 V2', 'V175', 'V173', 'UNF130Z')\n"
+                    "  and C.yun_xing_zhuang_tai = '在线'\n"
+                    "GROUP BY\n"
+                    "    A.fen_guang_qi_ming_cheng,\n"
+                    "    A.fen_guang_qi_ji_bie,\n"
+                    "    B.fen_guang_qi_ming_cheng,\n"
+                    "    B.shang_lian_she_bei,\n"
+                    "    B.shang_lian_she_bei_zhu_yong_duan_kou,\n"
+                    "    E.suo_shu_ji_fang_zi_yuan_dian,\n"
+                    "    A.shang_lian_she_bei_zhu_yong_duan_kou\n"
+                    "ORDER BY onu_count DESC;\n"
+                )
+                print(f"[TASK][FTTR][ONU] step2 jifang={jifang} executing SQL")
+                rows = await execute_query_dicts(sql_step2, [jifang])
+                base_name = f"FTTR鉴别_ONU_{onu}_同机房推荐"
     else:
         sql = (
-            "select A.fen_guang_qi_ming_cheng as erji_fen_guang, A.fen_guang_qi_ji_bie, B.fen_guang_qi_ming_cheng as yiji_fen_guang, A.shang_lian_she_bei_zhu_yong_duan_kou, A.shang_lian_she_bei_zhu_yong_duan_kou ~ 'CG' as support_open_FTTR\n"
+            "select A.fen_guang_qi_ming_cheng as erji_fen_guang,\n"
+            "       A.fen_guang_qi_ji_bie,\n"
+            "       B.fen_guang_qi_ming_cheng as yiji_fen_guang,\n"
+            "       B.shang_lian_she_bei as OLT_mingcheng,\n"
+            "       B.shang_lian_she_bei_zhu_yong_duan_kou as OLT_PON_kou,\n"
+            "       E.suo_shu_ji_fang_zi_yuan_dian as jifang,\n"
+            "       A.shang_lian_she_bei_zhu_yong_duan_kou,\n"
+            "       A.shang_lian_she_bei_zhu_yong_duan_kou ~ 'CG' as support_open_FTTR\n"
             "from \"zi_guan_-_fen_guang_qi_763b860d\" A left join \"zi_guan_-_fen_guang_qi_763b860d\" B on B.fen_guang_qi_ming_cheng = A.shang_lian_fen_guang_qi\n"
+            "left join \"zi_guan_-_olt_68131c82\" E on E.olt_ming_cheng = B.shang_lian_she_bei\n"
             "where A.fen_guang_qi_ji_bie = '二级分光' and A.fen_guang_qi_ming_cheng = $1\n"
         )
         print(f"[TASK][FTTR][FGQ] erji={erji} executing SQL")
         rows = await execute_query_dicts(sql, [erji])
         base_name = f"FTTR鉴别_二级分光_{erji}"
 
+        # 若该二级分光器不支持CG口，则基于机房进一步推荐同机房内支持的二级分光器
+        def _support_fgq(rec: Dict[str, Any]) -> bool:
+            return bool(rec.get("support_open_FTTR")) or bool(rec.get("support_open_fttr"))
+
+        if (not rows) or (rows and not any(_support_fgq(r) for r in rows)):
+            jifang_val = rows[0].get("jifang") if rows else None
+            if jifang_val:
+                sql_step2 = (
+                    "select\n"
+                    "    A.fen_guang_qi_ming_cheng as erji_fen_guang,\n"
+                    "    COUNT(C.onu_ming_cheng) as onu_count,\n"
+                    "    A.fen_guang_qi_ji_bie,\n"
+                    "    B.fen_guang_qi_ming_cheng as yiji_fen_guang,\n"
+                    "    B.shang_lian_she_bei as OLT_mingcheng,\n"
+                    "    B.shang_lian_she_bei_zhu_yong_duan_kou as OLT_PON_kou,\n"
+                    "    E.suo_shu_ji_fang_zi_yuan_dian as jifang,\n"
+                    "    A.shang_lian_she_bei_zhu_yong_duan_kou,\n"
+                    "    A.shang_lian_she_bei_zhu_yong_duan_kou ~ 'CG' as fenguangqi_support_open_FTTR,\n"
+                    "    STRING_AGG(C.zhong_duan_lei_xing, ', ') as zhong_duan_lei_xing_list,\n"
+                    "    BOOL_OR(C.zhong_duan_lei_xing in ('V176-20', 'HN8145XR', 'HG3142F', 'ZXHN G7611 V2', 'V175', 'V173', 'UNF130Z')) as has_single_ONU_support_fttr\n\n"
+                    "from \"yue_ri_wang_guan_onu_zai_xian_qing_dan_4f929071\" C\n"
+                    "join \"zi_guan_-_onu_guang_mao_yong_hu_d88a2209\" D on C.onu_ming_cheng = D.xin_zeng_onu\n"
+                    "left join \"zi_guan_-_fen_guang_qi_763b860d\" A on A.fen_guang_qi_ming_cheng = D.jie_ru_she_bei_ming_cheng\n"
+                    "left join \"zi_guan_-_fen_guang_qi_763b860d\" B\n"
+                    "    on B.fen_guang_qi_ming_cheng = A.shang_lian_fen_guang_qi\n"
+                    "left join \"zi_guan_-_olt_68131c82\" E on E.olt_ming_cheng = B.shang_lian_she_bei\n"
+                    "where A.fen_guang_qi_ji_bie = '二级分光'\n"
+                    "  and E.suo_shu_ji_fang_zi_yuan_dian = $1 and (A.shang_lian_she_bei_zhu_yong_duan_kou ~ 'CG') and C.zhong_duan_lei_xing not in ('V176-20', 'HN8145XR', 'HG3142F', 'ZXHN G7611 V2', 'V175', 'V173', 'UNF130Z')\n"
+                    "  and C.yun_xing_zhuang_tai = '在线'\n"
+                    "GROUP BY\n"
+                    "    A.fen_guang_qi_ming_cheng,\n"
+                    "    A.fen_guang_qi_ji_bie,\n"
+                    "    B.fen_guang_qi_ming_cheng,\n"
+                    "    B.shang_lian_she_bei,\n"
+                    "    B.shang_lian_she_bei_zhu_yong_duan_kou,\n"
+                    "    E.suo_shu_ji_fang_zi_yuan_dian,\n"
+                    "    A.shang_lian_she_bei_zhu_yong_duan_kou\n"
+                    "ORDER BY onu_count DESC;\n"
+                )
+                print(f"[TASK][FTTR][FGQ] jifang-step erji={erji} jifang={jifang_val} executing SQL")
+                rows = await execute_query_dicts(sql_step2, [jifang_val])
+                base_name = f"FTTR鉴别_二级分光_{erji}_同机房推荐"
+
     preview = rows[:5]
     export = await export_rows_to_excel(rows, base_filename=base_name)
     print(f"[TASK][FTTR] rows={len(rows)} file={export['filename']}")
     return {
+        "rows": rows,
         "preview": preview,
         "fileId": export["id"],
         "filename": export["filename"],

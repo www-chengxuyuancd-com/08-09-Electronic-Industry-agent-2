@@ -7,6 +7,8 @@ export interface ChatMessage {
   sql?: string;
   queryResults?: any[];
   error?: string;
+  entityType?: string;
+  entityName?: string;
 }
 
 export interface ChatState {

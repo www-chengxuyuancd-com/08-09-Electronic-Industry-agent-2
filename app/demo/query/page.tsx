@@ -11,24 +11,52 @@ import { Loader2 } from "lucide-react";
 import { ChartVisualization } from "@/components/charts/ChartVisualization";
 import { LLMQueryInput } from "@/components/demo/llm-query-input";
 import { Label } from "@/components/ui/label";
+import React from "react";
 
 export default function SqlQueryDemo() {
   const [query, setQuery] = useState<string>("");
   const [results, setResults] = useState<TableData[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
+  const [hasExecuted, setHasExecuted] = useState<boolean>(false);
+  const [userInput, setUserInput] = useState<string>("");
+
+  const entityInfo = React.useMemo(() => {
+    const input = userInput || "";
+    const normalized = input.toLowerCase();
+    const isONU = normalized.includes("onu") || input.includes("光猫");
+    const isSplitter = input.includes("分光器");
+    const match =
+      input.match(/'(.*?)'/) ||
+      input.match(/“(.*?)”/) ||
+      input.match(/「(.*?)」/);
+    const entityName = match && match[1] ? match[1].trim() : undefined;
+    const entityType = isONU ? "ONU" : isSplitter ? "分光器" : undefined;
+    return { entityType, entityName } as {
+      entityType?: "ONU" | "分光器";
+      entityName?: string;
+    };
+  }, [userInput]);
 
   const handleExecuteQuery = async () => {
     if (!query.trim()) return;
 
     setLoading(true);
     setError(null);
+    setHasExecuted(true);
 
     try {
-      const response = await sqlClient.executeQuery(query);
+      const response = await sqlClient.executeQuery(query, {
+        entityType: entityInfo.entityType,
+        entityName: entityInfo.entityName,
+      });
 
       if (response.success && response.data) {
-        setResults(response.data);
+        const payload: any = response.data;
+        const rows: TableData[] = Array.isArray(payload)
+          ? payload
+          : payload.data || [];
+        setResults(rows);
       } else {
         const errorMessage =
           response.error?.message || "查询失败，请检查SQL语句";
@@ -56,7 +84,12 @@ export default function SqlQueryDemo() {
       <h1 className="text-2xl font-bold mb-6">SQL查询演示</h1>
 
       {/* 自然语言生成SQL (顶部) */}
-      <LLMQueryInput onSqlGenerated={handleSqlGenerated} />
+      <LLMQueryInput
+        onSqlGenerated={(sql) => {
+          handleSqlGenerated(sql);
+        }}
+        onUserInput={(text) => setUserInput(text)}
+      />
 
       {/* SQL编辑器 (中间) */}
       <Card className="p-6 mb-6">
@@ -95,6 +128,15 @@ export default function SqlQueryDemo() {
         <div className="bg-destructive/15 border border-destructive text-destructive p-4 rounded-md mb-6">
           <p className="font-medium">查询错误</p>
           <p className="text-sm">{error}</p>
+        </div>
+      )}
+
+      {/* 空结果提示 */}
+      {!error && hasExecuted && !loading && results.length === 0 && (
+        <div className="bg-muted/40 border border-dashed rounded-md p-4 text-sm text-muted-foreground mb-6">
+          {entityInfo.entityType && entityInfo.entityName
+            ? `您输入的${entityInfo.entityType}名称: '${entityInfo.entityName}' 找不到对应的数据`
+            : "查询成功，但没有返回数据。请调整查询条件或检查数据源。"}
         </div>
       )}
 

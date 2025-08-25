@@ -17,9 +17,13 @@ import { Label } from "@/components/ui/label";
 
 interface LLMQueryInputProps {
   onSqlGenerated: (sql: string) => void;
+  onUserInput?: (text: string) => void;
 }
 
-export function LLMQueryInput({ onSqlGenerated }: LLMQueryInputProps) {
+export function LLMQueryInput({
+  onSqlGenerated,
+  onUserInput,
+}: LLMQueryInputProps) {
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -38,6 +42,9 @@ export function LLMQueryInput({ onSqlGenerated }: LLMQueryInputProps) {
       });
 
       const cleanSql = cleanSqlQuery(result.sql);
+      if (onUserInput) {
+        onUserInput(input);
+      }
       onSqlGenerated(cleanSql);
     } catch (error: unknown) {
       console.error("LLM查询失败:", error);

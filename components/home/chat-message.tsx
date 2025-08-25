@@ -25,6 +25,33 @@ export function ChatMessage({
   const [editedSQL, setEditedSQL] = useState(message.sql || "");
   const [isEditing, setIsEditing] = useState(false);
 
+  const entityInfo = React.useMemo(() => {
+    const input = message.content || "";
+    const normalized = input.toLowerCase();
+    const isONU = normalized.includes("onu") || input.includes("光猫");
+    const isSplitter = input.includes("分光器");
+
+    const match =
+      input.match(/'(.*?)'/) ||
+      input.match(/“(.*?)”/) ||
+      input.match(/「(.*?)」/);
+
+    const entityName = match && match[1] ? match[1].trim() : undefined;
+    const entityType = isONU ? "ONU" : isSplitter ? "分光器" : undefined;
+
+    return { entityType, entityName } as {
+      entityType?: "ONU" | "分光器";
+      entityName?: string;
+    };
+  }, [message.content]);
+
+  // Prefer longer name among backend-provided and parsed
+  const parsedName = entityInfo.entityName || "";
+  const backendName = message.entityName || "";
+  const displayEntityName =
+    backendName.length >= parsedName.length ? backendName : parsedName;
+  const displayEntityType = message.entityType || entityInfo.entityType;
+
   const handleCopySQL = () => {
     if (message.sql) {
       navigator.clipboard.writeText(message.sql);
@@ -217,6 +244,58 @@ export function ChatMessage({
                   </div>
                 </div>
                 <TablePreview data={message.queryResults} />
+              </CardContent>
+            </Card>
+          )}
+
+          {/* 同机房推荐（当主结果不支持时显示） */}
+          {Array.isArray(message.queryResults) &&
+            message.queryResults.length > 0 &&
+            !(message.queryResults as any[]).some(
+              (r: any) =>
+                r?.fenguangqi_support_open_FTTR ||
+                r?.fenguangqi_support_open_fttr ||
+                r?.support_open_FTTR ||
+                r?.support_open_fttr
+            ) &&
+            Array.isArray((message as any).recommendations) &&
+            ((message as any).recommendations as any[]).length > 0 && (
+              <Card>
+                <CardContent className="pt-4">
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="text-xs text-muted-foreground">
+                      同机房推荐（满足CG口且更适合开通FTTR）
+                    </div>
+                  </div>
+                  <TablePreview
+                    data={(message as any).recommendations as any}
+                  />
+                </CardContent>
+              </Card>
+            )}
+
+          {/* 查询结果为空时的提示 */}
+          {message.queryResults && message.queryResults.length === 0 && (
+            <Card>
+              <CardContent className="pt-4">
+                <div className="flex items-center justify-between mb-3">
+                  <div className="text-xs text-muted-foreground">查询结果</div>
+                  {message.sql && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleDownload}
+                      className="h-7 px-2 gap-1"
+                    >
+                      <Download className="h-3 w-3" /> 下载Excel
+                    </Button>
+                  )}
+                </div>
+                <div className="bg-muted/40 border border-dashed rounded-md p-3 text-sm text-muted-foreground">
+                  {displayEntityType && displayEntityName
+                    ? `您输入的${displayEntityType}名称: '${displayEntityName}' 找不到对应的数据`
+                    : "查询成功，但没有返回数据。请调整查询条件或检查数据源。"}
+                </div>
               </CardContent>
             </Card>
           )}

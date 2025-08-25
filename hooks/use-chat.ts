@@ -24,8 +24,16 @@ export function useChat(): UseChatReturn {
     reset: resetLLM,
   } = useLLMStream();
 
-  const { queryResults, queryError, isExecuting, executeQuery, clearResults } =
-    useSqlQuery();
+  const {
+    queryResults,
+    recommendations,
+    queryError,
+    isExecuting,
+    executeQuery,
+    clearResults,
+    entityType,
+    entityName,
+  } = useSqlQuery();
 
   const sendMessage = useCallback(
     async (content: string) => {
@@ -61,7 +69,32 @@ export function useChat(): UseChatReturn {
   const executeSQL = useCallback(
     async (sql: string) => {
       try {
-        await executeQuery(sql);
+        // Try to extract entity info from the last user message content
+        let inferredType: string | undefined = entityType;
+        let inferredName: string | undefined = entityName;
+        const lastUser = messages
+          .slice()
+          .reverse()
+          .find((m) => m.type === "user");
+        if (lastUser) {
+          const text = lastUser.content || "";
+          const isONU =
+            text.toLowerCase().includes("onu") || text.includes("光猫");
+          const isSplitter = text.includes("分光器");
+          const match =
+            text.match(/'(.*?)'/) ||
+            text.match(/“(.*?)”/) ||
+            text.match(/「(.*?)」/);
+          const name = match && match[1] ? match[1].trim() : undefined;
+          if (!inferredType)
+            inferredType = isONU ? "ONU" : isSplitter ? "分光器" : undefined;
+          if (!inferredName && name) inferredName = name;
+        }
+
+        await executeQuery(sql, {
+          entityType: inferredType,
+          entityName: inferredName,
+        });
         // executeQuery 会更新 queryResults 状态，我们在 useEffect 中监听这个变化
       } catch (error) {
         // 更新最后一条AI消息，添加错误信息
@@ -111,19 +144,22 @@ export function useChat(): UseChatReturn {
     }
   }, [isComplete, generatedSql, thinking, executeSQL]);
 
-  // 监听查询结果更新
+  // 监听查询结果更新（包括空结果），并附带实体元数据与推荐
   React.useEffect(() => {
-    if (queryResults && queryResults.length > 0) {
-      setMessages((prev) => {
-        const newMessages = [...prev];
-        const lastMessage = newMessages[newMessages.length - 1];
-        if (lastMessage && lastMessage.type === "assistant") {
-          lastMessage.queryResults = queryResults;
+    setMessages((prev) => {
+      const newMessages = [...prev];
+      const lastMessage = newMessages[newMessages.length - 1];
+      if (lastMessage && lastMessage.type === "assistant") {
+        lastMessage.queryResults = queryResults;
+        if (recommendations && (recommendations as any).length > 0) {
+          (lastMessage as any).recommendations = recommendations;
         }
-        return newMessages;
-      });
-    }
-  }, [queryResults]);
+        if (entityType) lastMessage.entityType = entityType;
+        if (entityName) lastMessage.entityName = entityName;
+      }
+      return newMessages;
+    });
+  }, [queryResults, recommendations, entityType, entityName]);
 
   // 监听查询错误
   React.useEffect(() => {
