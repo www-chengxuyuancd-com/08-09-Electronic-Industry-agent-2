@@ -46,3 +46,13 @@ backend/.venv
 .idea
 .pycharm
 .vscode
+
+backend/electronic-industry-agent/files/*
+
+backend/__pycache__/*
+
+backend.log
+
+frontend.log
+
+backend/__pycache__/*

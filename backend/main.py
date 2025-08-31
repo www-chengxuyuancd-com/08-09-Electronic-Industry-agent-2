@@ -9,13 +9,14 @@ import json
 import re
 import asyncio
 from datetime import datetime
-from typing import Dict, Any, List, Optional, AsyncGenerator
+from typing import Dict, Any, List, Optional, AsyncGenerator, Tuple
 from contextlib import asynccontextmanager
 import uuid
 import csv
 import aiofiles
 import pathlib
 import hashlib
+import traceback
 
 import asyncpg
 import pandas as pd
@@ -28,6 +29,15 @@ from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+# Config module import (dataset presets)
+try:
+    import sys as _sys
+    _cfg_dir = os.path.join(os.path.dirname(__file__), "electronic-industry-agent")
+    if _cfg_dir not in _sys.path:
+        _sys.path.append(_cfg_dir)
+    from config import DATASET_PRESETS as CONFIG_DATASET_PRESETS
+except Exception:
+    CONFIG_DATASET_PRESETS = {}
 
 # Database configuration
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://username:password@localhost:5432/dbname")
@@ -240,6 +250,19 @@ class SQLExportResponse(BaseModel):
     filename: str
     downloadUrl: str
     rowCount: int
+
+class DatasetDiffResponse(BaseModel):
+    datasetKey: str
+    displayName: str
+    targetTable: str
+    totalRows: int
+    addedCount: int
+    updatedCount: int
+    deletedCount: int
+    fileId: str
+    filename: str
+    downloadUrl: str
+    uniqueColumns: List[str]
 
 # Utility functions
 def clean_sql_query(sql: str) -> str:
@@ -511,6 +534,376 @@ def get_storage_dir() -> str:
     storage = os.path.join(base_dir, "electronic-industry-agent", "files")
     os.makedirs(storage, exist_ok=True)
     return storage
+
+DATASET_PRESETS: Dict[str, Dict[str, Any]] = CONFIG_DATASET_PRESETS or {}
+
+def get_dataset_config(dataset_key: str) -> Dict[str, Any]:
+    preset = DATASET_PRESETS.get(dataset_key)
+    if not preset:
+        raise HTTPException(status_code=400, detail=f"未知的数据集标识: {dataset_key}")
+    return {
+        "dataset_key": dataset_key,
+        "display_name": preset["display_name"],
+        "target_table": preset["target_table"],
+        "unique_columns": list(preset.get("unique_columns") or []),
+    }
+
+def normalize_value_for_diff(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    s = str(value)
+    s = s.strip()
+    if s == "":
+        return None
+    return s
+
+def compute_key_tuple(row: Dict[str, Any], unique_columns: List[str]) -> Tuple[Any, ...]:
+    parts: List[Any] = []
+    for c in unique_columns:
+        parts.append(normalize_value_for_diff(row.get(c)))
+    return tuple(parts)
+
+def rows_to_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame()
+    # Preserve first-row keys order
+    cols = list(rows[0].keys())
+    return pd.DataFrame(rows, columns=cols)
+
+async def export_diffs_excel(added: List[Dict[str, Any]], updated_new: List[Dict[str, Any]], deleted: List[Dict[str, Any]], base_filename: str) -> Dict[str, str]:
+    storage_dir = get_storage_dir()
+    export_id = str(uuid.uuid4())
+    ts = datetime.now().strftime("%Y%m%d%H%M%S")
+    safe_base = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff_-]+", "_", base_filename).strip("_") or "diff"
+    filename = f"{safe_base}_{ts}.xlsx"
+    path = os.path.join(storage_dir, filename)
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        rows_to_df(added).to_excel(writer, sheet_name="新增", index=False)
+        rows_to_df(updated_new).to_excel(writer, sheet_name="修改", index=False)
+        rows_to_df(deleted).to_excel(writer, sheet_name="删除", index=False)
+    # record in DB
+    global db_pool
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                await ensure_migrations_tables(conn)
+                await conn.execute(
+                    "insert into file_uploads (id, filename, path, size_bytes, content_type, status) values ($1, $2, $3, $4, $5, 'generated')",
+                    uuid.UUID(export_id), filename, path, os.path.getsize(path), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+        except Exception:
+            pass
+    return {"id": export_id, "filename": filename, "path": path}
+
+async def table_exists(connection: asyncpg.Connection, table_name: str) -> bool:
+    q = "select to_regclass($1) is not null as exists"
+    try:
+        exists = await connection.fetchval(q, table_name)
+        return bool(exists)
+    except Exception:
+        return False
+
+async def fetch_all_rows(connection: asyncpg.Connection, table_name: str) -> List[Dict[str, Any]]:
+    try:
+        rows = await connection.fetch(f'select * from "{table_name}"')
+        return [serialize_db_result(dict(r)) for r in rows]
+    except Exception:
+        # Try without quotes when input already safe
+        try:
+            rows = await connection.fetch(f'select * from {table_name}')
+            return [serialize_db_result(dict(r)) for r in rows]
+        except Exception:
+            return []
+
+async def parse_tabular_file_to_rows(file_path: str) -> List[Dict[str, Any]]:
+    # Handle CSV or Excel (first sheet)
+    suffix = pathlib.Path(file_path).suffix.lower()
+    rows: List[Dict[str, Any]] = []
+    if suffix == ".csv":
+        enc = _detect_csv_encoding(file_path)
+        with open(file_path, mode="r", encoding=enc, newline="") as f_sync:
+            reader_sync = csv.reader(f_sync)
+            try:
+                headers = next(reader_sync)
+            except StopIteration:
+                return []
+            headers = [str(h).strip() if h is not None else "" for h in headers]
+            # Build pinyin-based columns with underscores
+            try:
+                import sys as _sys
+                _utils_dir = os.path.join(os.path.dirname(__file__), "electronic-industry-agent")
+                if _utils_dir not in _sys.path:
+                    _sys.path.append(_utils_dir)
+                from utils import to_pinyin_list as _to_pinyin_list_cols
+                base_names = [h if (h and isinstance(h, str) and h.strip() != "") else f"c_{i}" for i, h in enumerate(headers)]
+                computed_columns = _to_pinyin_list_cols(base_names)
+                computed_columns = [sanitize_identifier(c) for c in computed_columns]
+            except Exception:
+                computed_columns = [sanitize_identifier(h or f"c_{i}") for i, h in enumerate(headers)]
+            for row in reader_sync:
+                normalized = [normalize_value_for_diff(cell) for cell in row]
+                if all(v is None for v in normalized):
+                    continue
+                # align length
+                if len(normalized) < len(computed_columns):
+                    normalized += [None] * (len(computed_columns) - len(normalized))
+                elif len(normalized) > len(computed_columns):
+                    normalized = normalized[: len(computed_columns)]
+                rows.append({computed_columns[i]: normalized[i] for i in range(len(computed_columns))})
+        return rows
+    # Excel
+    from openpyxl import load_workbook
+    wb = load_workbook(filename=file_path, read_only=True, data_only=True)
+    ws = wb.worksheets[0]
+    def non_empty_count(row_vals):
+        return sum(1 for v in row_vals if v is not None and str(v).strip() != "")
+    def effective_width(row_vals):
+        last_idx = -1
+        for idx, v in enumerate(row_vals):
+            if v is not None and str(v).strip() != "":
+                last_idx = idx
+        return last_idx + 1
+    scanned = list(ws.iter_rows(min_row=1, max_row=50, max_col=1024, values_only=True))
+    header_row_index = 1
+    header_non_empty = 0
+    for idx, row_vals in enumerate(scanned, start=1):
+        cnt = non_empty_count(row_vals)
+        if cnt > header_non_empty and (cnt >= 2 or header_non_empty == 0):
+            header_row_index = idx
+            header_non_empty = cnt
+    header_row = scanned[header_row_index - 1] if scanned else []
+    headers = [str(h).strip() if h is not None else "" for h in header_row]
+    num_cols = effective_width(header_row)
+    if num_cols == 0:
+        next_index = header_row_index + 1
+        next_rows = list(ws.iter_rows(min_row=next_index, max_row=next_index, max_col=1024, values_only=True))
+        first_data = next_rows[0] if next_rows else []
+        num_cols = effective_width(first_data)
+        headers = [f"col_{i}" for i in range(num_cols)]
+        data_start_row = next_index
+    else:
+        if len(headers) < num_cols:
+            headers = headers + [f"col_{i}" for i in range(len(headers), num_cols)]
+        elif len(headers) > num_cols:
+            headers = headers[:num_cols]
+        data_start_row = header_row_index + 1
+    # Build pinyin-based columns with underscores
+    try:
+        import sys as _sys
+        _utils_dir = os.path.join(os.path.dirname(__file__), "electronic-industry-agent")
+        if _utils_dir not in _sys.path:
+            _sys.path.append(_utils_dir)
+        from utils import to_pinyin_list as _to_pinyin_list_cols
+        base_names = [h if (h and isinstance(h, str) and h.strip() != "") else f"c_{i}" for i, h in enumerate(headers)]
+        columns = _to_pinyin_list_cols(base_names)
+        columns = [sanitize_identifier(c) for c in columns]
+    except Exception:
+        columns = [sanitize_identifier(h or f"c_{i}") for i, h in enumerate(headers)]
+    def normalize_row(row_tuple):
+        row_list = [normalize_value_for_diff(cell) for cell in row_tuple]
+        if all(v is None for v in row_list):
+            return None
+        if len(row_list) < len(columns):
+            row_list += [None] * (len(columns) - len(row_list))
+        elif len(row_list) > len(columns):
+            row_list = row_list[: len(columns)]
+        return row_list
+    data_rows_iter = ws.iter_rows(min_row=data_start_row, max_col=len(columns), values_only=True)
+    for row in data_rows_iter:
+        nr = normalize_row(row)
+        if nr is None:
+            continue
+        rows.append({columns[i]: nr[i] for i in range(len(columns))})
+    try:
+        wb.close()
+    except Exception:
+        pass
+    return rows
+
+async def get_existing_columns(connection: asyncpg.Connection, table_name: str) -> List[str]:
+    try:
+        rows = await connection.fetch(
+            """
+            select column_name
+            from information_schema.columns
+            where table_schema = 'public' and table_name = $1
+            order by ordinal_position
+            """,
+            table_name,
+        )
+        return [r["column_name"] for r in rows]
+    except Exception:
+        return []
+
+async def ensure_target_table(connection: asyncpg.Connection, table_name: str, columns: List[str]) -> None:
+    if not columns:
+        return
+    cols_defs = ", ".join([f'"{c}" text' for c in columns])
+    await connection.execute(f'create table if not exists "{table_name}" ({cols_defs});')
+    # Add missing columns if table already exists
+    existing = await get_existing_columns(connection, table_name)
+    existing_set = set(existing)
+    for c in columns:
+        if c not in existing_set:
+            try:
+                await connection.execute(f'alter table "{table_name}" add column "{c}" text;')
+            except Exception:
+                pass
+
+async def bulk_insert_rows(connection: asyncpg.Connection, table_name: str, columns: List[str], rows: List[Dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    placeholders = ", ".join([f"${i+1}" for i in range(len(columns))])
+    insert_sql = f'insert into "{table_name}" ({", ".join([f"\"{c}\"" for c in columns])}) values ({placeholders})'
+    values_batches: List[List[Any]] = []
+    for r in rows:
+        values_batches.append([normalize_value_for_diff(r.get(c)) for c in columns])
+    await connection.executemany(insert_sql, values_batches)
+    return len(rows)
+
+async def update_row_by_keys(connection: asyncpg.Connection, table_name: str, all_columns: List[str], key_columns: List[str], row: Dict[str, Any]) -> None:
+    set_columns = [c for c in all_columns if c not in key_columns]
+    if not set_columns:
+        return
+    set_clause = ", ".join([f'"{c}" = ${i+1}' for i, c in enumerate(set_columns)])
+    where_clause = " and ".join([f'"{kc}" = ${len(set_columns) + idx + 1}' for idx, kc in enumerate(key_columns)])
+    sql = f'update "{table_name}" set {set_clause} where {where_clause}'
+    params: List[Any] = [normalize_value_for_diff(row.get(c)) for c in set_columns] + [normalize_value_for_diff(row.get(k)) for k in key_columns]
+    await connection.execute(sql, *params)
+
+async def delete_row_by_keys(connection: asyncpg.Connection, table_name: str, key_columns: List[str], row: Dict[str, Any]) -> None:
+    if not key_columns:
+        return
+    where_clause = " and ".join([f'"{kc}" = ${idx + 1}' for idx, kc in enumerate(key_columns)])
+    sql = f'delete from "{table_name}" where {where_clause}'
+    params: List[Any] = [normalize_value_for_diff(row.get(k)) for k in key_columns]
+    await connection.execute(sql, *params)
+
+@app.post("/api/datasets/{dataset_key}/diff-upload", response_model=DatasetDiffResponse)
+async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
+    global db_pool
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="数据库连接不可用")
+    if not file:
+        raise HTTPException(status_code=400, detail="缺少上传文件")
+    try:
+        async with db_pool.acquire() as conn:
+            await ensure_migrations_tables(conn)
+            cfg = get_dataset_config(dataset_key)
+            display_name = cfg["display_name"]
+            target_table = cfg["target_table"]
+            unique_columns: List[str] = list(cfg.get("unique_columns") or [])
+
+        storage_dir = get_storage_dir()
+        upload_id = str(uuid.uuid4())
+        safe_name = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff_.-]+", "_", file.filename)
+        target_path = os.path.join(storage_dir, f"{upload_id}_{safe_name}")
+        size_bytes = 0
+        async with aiofiles.open(target_path, 'wb') as out:
+            while True:
+                chunk = await file.read(1024 * 1024 * 4)
+                if not chunk:
+                    break
+                size_bytes += len(chunk)
+                await out.write(chunk)
+        print(f"[diff-upload] key={dataset_key} name={file.filename} size={size_bytes}")
+
+        # Parse uploaded rows
+        new_rows = await parse_tabular_file_to_rows(target_path)
+        total_rows = len(new_rows)
+
+        # Fetch existing data
+        async with db_pool.acquire() as conn2:
+            # Ensure target table exists/has columns
+            detected_columns: List[str] = list(new_rows[0].keys()) if new_rows else []
+            await ensure_target_table(conn2, target_table, detected_columns)
+            existing_rows = await fetch_all_rows(conn2, target_table)
+
+        # Derive unique columns if not configured
+        if not unique_columns:
+            if new_rows:
+                unique_columns = [list(new_rows[0].keys())[0]]
+            else:
+                unique_columns = []
+
+        # Index by key
+        new_index: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        for r in new_rows:
+            k = compute_key_tuple(r, unique_columns) if unique_columns else tuple(sorted(r.items()))
+            new_index[k] = r
+        old_index: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        for r in existing_rows:
+            k = compute_key_tuple(r, unique_columns) if unique_columns else tuple(sorted(r.items()))
+            old_index[k] = r
+
+        new_keys = set(new_index.keys())
+        old_keys = set(old_index.keys())
+        # Do not sort to avoid comparing heterogeneous key parts (e.g., None vs str)
+        added_keys = list(new_keys - old_keys)
+        deleted_keys = list(old_keys - new_keys)
+        common_keys = new_keys & old_keys
+
+        def rows_equal_excluding_keys(a: Dict[str, Any], b: Dict[str, Any], key_cols: List[str]) -> bool:
+            a_norm = {c: normalize_value_for_diff(v) for c, v in a.items() if c not in key_cols}
+            b_norm = {c: normalize_value_for_diff(v) for c, v in b.items() if c not in key_cols}
+            # Compare on union of columns
+            all_cols = set(a_norm.keys()) | set(b_norm.keys())
+            for c in all_cols:
+                if (a_norm.get(c) or None) != (b_norm.get(c) or None):
+                    return False
+            return True
+
+        updated_keys: List[Tuple[Any, ...]] = []
+        for k in common_keys:
+            if not rows_equal_excluding_keys(new_index[k], old_index[k], unique_columns):
+                updated_keys.append(k)
+
+        added_rows = [new_index[k] for k in added_keys]
+        updated_new_rows = [new_index[k] for k in updated_keys]
+        deleted_rows = [old_index[k] for k in deleted_keys]
+
+        # Write-back to DB
+        async with db_pool.acquire() as connw:
+            await ensure_target_table(connw, target_table, list(new_rows[0].keys()) if new_rows else [])
+            if not unique_columns:
+                # Overwrite strategy: truncate then bulk insert
+                await connw.execute(f'truncate table "{target_table}"')
+                await bulk_insert_rows(connw, target_table, list(new_rows[0].keys()) if new_rows else [], new_rows)
+            else:
+                # Apply changes based on diffs
+                cols = list(new_rows[0].keys()) if new_rows else await get_existing_columns(connw, target_table)
+                for r in added_rows:
+                    await bulk_insert_rows(connw, target_table, cols, [r])
+                for r in updated_new_rows:
+                    await update_row_by_keys(connw, target_table, cols, unique_columns, r)
+                for r in deleted_rows:
+                    await delete_row_by_keys(connw, target_table, unique_columns, r)
+
+        export = await export_diffs_excel(added_rows, updated_new_rows, deleted_rows, base_filename=f"{display_name}-差异")
+
+        return {
+            "datasetKey": dataset_key,
+            "displayName": display_name,
+            "targetTable": target_table,
+            "totalRows": total_rows,
+            "addedCount": len(added_rows),
+            "updatedCount": len(updated_new_rows),
+            "deletedCount": len(deleted_rows),
+            "fileId": export["id"],
+            "filename": export["filename"],
+            "downloadUrl": f"/api/files/download/{export['id']}",
+            "uniqueColumns": unique_columns,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[diff-upload][error] {e.__class__.__name__}: {e}\n{tb}")
+        raise HTTPException(status_code=500, detail={
+            "message": f"处理对比上传失败: {str(e)}",
+            "errorType": e.__class__.__name__,
+            "traceback": tb,
+        })
 
 def sanitize_identifier(name: str) -> str:
     cleaned = re.sub(r"[^0-9a-zA-Z_]+", "_", name.strip())

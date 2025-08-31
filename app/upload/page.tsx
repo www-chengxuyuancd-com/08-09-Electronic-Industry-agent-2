@@ -14,12 +14,35 @@ import {
 } from "@/components/ui/table";
 
 export default function UploadPage() {
-  const [file, setFile] = useState<File | null>(null);
-  const [isUploading, setIsUploading] = useState(false);
   const [files, setFiles] = useState<any[]>([]);
+  const [selectedFiles, setSelectedFiles] = useState<
+    Record<string, File | null>
+  >({});
+  const [uploadingKey, setUploadingKey] = useState<string | null>(null);
+  const [diffResult, setDiffResult] = useState<null | {
+    datasetKey: string;
+    displayName: string;
+    targetTable: string;
+    totalRows: number;
+    addedCount: number;
+    updatedCount: number;
+    deletedCount: number;
+    filename: string;
+    downloadUrl: string;
+    uniqueColumns: string[];
+  }>(null);
 
   const backend =
     process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+
+  const datasets: { key: string; title: string }[] = [
+    { key: "wangguan_onu", title: "网管ONU在线清单" },
+    { key: "ziguan_olt_duankou", title: "资管-OLT端口" },
+    { key: "ziguan_onu_guangmao", title: "资管-ONU光猫用户" },
+    { key: "ziguan_pon_wangluo", title: "资管-PON网络连接" },
+    { key: "ziguan_fenguangqi", title: "资管-分光器" },
+    { key: "jiake_yewu_xinxi", title: "家客业务信息表" },
+  ];
 
   async function fetchFiles() {
     const res = await fetch(`${backend}/api/files`, { cache: "no-store" });
@@ -35,23 +58,30 @@ export default function UploadPage() {
     return () => clearInterval(timer);
   }, []);
 
-  async function handleUpload() {
-    if (!file) return;
-    setIsUploading(true);
+  function onPickFile(key: string, f: File | null) {
+    setSelectedFiles((prev) => ({ ...prev, [key]: f }));
+  }
+
+  async function uploadDataset(key: string) {
+    const f = selectedFiles[key];
+    if (!f) return;
+    setUploadingKey(key);
     try {
       const form = new FormData();
-      form.append("file", file);
-      const res = await fetch(`${backend}/api/files/upload`, {
+      form.append("file", f);
+      const res = await fetch(`${backend}/api/datasets/${key}/diff-upload`, {
         method: "POST",
         body: form,
       });
-      if (!res.ok) throw new Error("上传失败");
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      setDiffResult(data);
+      setSelectedFiles((prev) => ({ ...prev, [key]: null }));
       await fetchFiles();
-      setFile(null);
     } catch (e) {
       console.error(e);
     } finally {
-      setIsUploading(false);
+      setUploadingKey(null);
     }
   }
 
@@ -64,18 +94,91 @@ export default function UploadPage() {
     <div className="p-6 space-y-6">
       <Card>
         <CardHeader>
-          <CardTitle>数据上传</CardTitle>
+          <CardTitle>按数据类型上传并对比</CardTitle>
         </CardHeader>
-        <CardContent className="flex gap-2 items-center">
-          <Input
-            type="file"
-            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-          />
-          <Button onClick={handleUpload} disabled={!file || isUploading}>
-            {isUploading ? "上传中..." : "上传"}
-          </Button>
+        <CardContent>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {datasets.map((ds) => (
+              <div key={ds.key} className="border rounded-lg p-4 space-y-3">
+                <div className="space-y-1">
+                  <div className="text-sm text-muted-foreground">{ds.key}</div>
+                  <div className="text-base font-medium">{ds.title}</div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Input
+                    type="file"
+                    onChange={(e) =>
+                      onPickFile(ds.key, e.target.files?.[0] ?? null)
+                    }
+                  />
+                  <Button
+                    onClick={() => uploadDataset(ds.key)}
+                    disabled={!selectedFiles[ds.key] || uploadingKey === ds.key}
+                  >
+                    {uploadingKey === ds.key ? "上传中..." : "上传并对比"}
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
         </CardContent>
       </Card>
+
+      {diffResult && (
+        <Card>
+          <CardHeader>
+            <CardTitle>对比结果 - {diffResult.displayName}</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+              <div className="rounded-md border p-3">
+                <div className="text-xs text-muted-foreground">总行数</div>
+                <div className="text-xl font-semibold">
+                  {diffResult.totalRows}
+                </div>
+              </div>
+              <div className="rounded-md border p-3">
+                <div className="text-xs text-muted-foreground">新增</div>
+                <div className="text-xl font-semibold text-emerald-600">
+                  {diffResult.addedCount}
+                </div>
+              </div>
+              <div className="rounded-md border p-3">
+                <div className="text-xs text-muted-foreground">修改</div>
+                <div className="text-xl font-semibold text-amber-600">
+                  {diffResult.updatedCount}
+                </div>
+              </div>
+              <div className="rounded-md border p-3">
+                <div className="text-xs text-muted-foreground">删除</div>
+                <div className="text-xl font-semibold text-rose-600">
+                  {diffResult.deletedCount}
+                </div>
+              </div>
+            </div>
+            <div className="mt-4 flex items-center gap-3">
+              <a
+                href={`${backend}${diffResult.downloadUrl}`}
+                target="_blank"
+                rel="noreferrer"
+              >
+                <Button variant="default">
+                  下载Excel ({diffResult.filename})
+                </Button>
+              </a>
+              {diffResult.uniqueColumns?.length ? (
+                <div className="text-xs text-muted-foreground">
+                  当前唯一键列：{diffResult.uniqueColumns.join(", ")}
+                </div>
+              ) : (
+                <div className="text-xs text-muted-foreground">
+                  未配置唯一键列（已临时使用首列作为键）
+                </div>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       <Card>
         <CardHeader>
@@ -110,7 +213,7 @@ export default function UploadPage() {
                   <TableCell>
                     {f.status === "uploaded" && (
                       <Button size="sm" onClick={() => triggerImport(f.id)}>
-                        导入CSV
+                        导入
                       </Button>
                     )}
                   </TableCell>
