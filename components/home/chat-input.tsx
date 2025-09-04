@@ -9,19 +9,26 @@ interface ChatInputProps {
   onSubmit: (input: string) => void;
   disabled?: boolean;
   placeholder?: string;
+  value?: string;
+  onChange?: (value: string) => void;
 }
 
 export function ChatInput({
   onSubmit,
   disabled = false,
   placeholder = "请输入您的查询需求，例如：查询所有用户的信息",
+  value,
+  onChange,
 }: ChatInputProps) {
-  const [input, setInput] = useState<string>("");
+  const [innerValue, setInnerValue] = useState<string>("");
+
+  const currentValue = value !== undefined ? value : innerValue;
+  const setValue = onChange ? onChange : setInnerValue;
 
   const handleSubmit = (): void => {
-    if (input.trim() && !disabled) {
-      onSubmit(input.trim());
-      setInput("");
+    if (currentValue.trim() && !disabled) {
+      onSubmit(currentValue.trim());
+      setValue("");
     }
   };
 
@@ -36,8 +43,8 @@ export function ChatInput({
     <div className="flex gap-3 items-end">
       <div className="flex-1">
         <Textarea
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
+          value={currentValue}
+          onChange={(e) => setValue(e.target.value)}
           onKeyDown={handleKeyPress}
           placeholder={placeholder}
           disabled={disabled}
@@ -47,7 +54,7 @@ export function ChatInput({
       </div>
       <Button
         onClick={handleSubmit}
-        disabled={disabled || !input.trim()}
+        disabled={disabled || !currentValue.trim()}
         size="icon"
         className="h-11 w-11 flex-shrink-0"
       >

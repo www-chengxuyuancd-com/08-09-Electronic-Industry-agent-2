@@ -46,6 +46,11 @@ DATASET_PRESETS = {
         "target_table": "wangguan_ONU_zaixianqingdan",
         "unique_columns": ["onu_ming_cheng"],
     },
+    "ziguan_olt": {
+        "display_name": "资管-OLT",
+        "target_table": "ziguan_olt_data",
+        "unique_columns": ["olt_ming_cheng"],
+    },
     "ziguan_olt_duankou": {
         "display_name": "资管-OLT端口",
         "target_table": "ziguan_OLT_duankou",

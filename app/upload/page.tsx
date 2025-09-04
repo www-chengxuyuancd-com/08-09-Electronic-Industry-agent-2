@@ -37,6 +37,7 @@ export default function UploadPage() {
 
   const datasets: { key: string; title: string }[] = [
     { key: "wangguan_onu", title: "网管ONU在线清单" },
+    { key: "ziguan_olt", title: "资管-OLT" },
     { key: "ziguan_olt_duankou", title: "资管-OLT端口" },
     { key: "ziguan_onu_guangmao", title: "资管-ONU光猫用户" },
     { key: "ziguan_pon_wangluo", title: "资管-PON网络连接" },
@@ -92,6 +93,11 @@ export default function UploadPage() {
 
   return (
     <div className="p-6 space-y-6">
+      <div className="flex items-center mb-2">
+        <a href="/">
+          <Button variant="secondary">返回首页</Button>
+        </a>
+      </div>
       <Card>
         <CardHeader>
           <CardTitle>按数据类型上传并对比</CardTitle>
