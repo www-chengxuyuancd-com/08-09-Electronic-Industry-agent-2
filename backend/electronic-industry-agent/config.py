@@ -64,16 +64,16 @@ DATASET_PRESETS = {
     "ziguan_pon_wangluo": {
         "display_name": "资管-PON网络连接",
         "target_table": "ziguan_PON_wangluo",
-        "unique_columns": [],
+        "unique_columns": ["zi_yuan_wei_yi_biao_zhi"],
     },
     "ziguan_fenguangqi": {
         "display_name": "资管-分光器",
         "target_table": "ziguan_fenguangqi",
-        "unique_columns": [],
+        "unique_columns": ["fen_guang_qi_ming_cheng"],
     },
     "jiake_yewu_xinxi": {
         "display_name": "家客业务信息表",
         "target_table": "jiake_yewu_xinxi",
-        "unique_columns": [],
+        "unique_columns": ["xin_zeng_onu"],
     },
 }

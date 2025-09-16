@@ -26,6 +26,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from openpyxl.styles import PatternFill
+from openpyxl.utils import get_column_letter
 
 # Load environment variables
 load_dotenv()
@@ -879,7 +881,166 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
                 for r in deleted_rows:
                     await delete_row_by_keys(connw, target_table, unique_columns, r)
 
-        export = await export_diffs_excel(added_rows, updated_new_rows, deleted_rows, base_filename=f"{display_name}-差异")
+        # Special post-processing for 家客业务信息表
+        if dataset_key == "jiake_yewu_xinxi":
+            # 1) Detect mismatches between jiake_yewu_xinxi (A) and wangguan_ONU_zaixianqingdan (B)
+            async with db_pool.acquire() as connv:
+                mismatch_rows = await connv.fetch(
+                    """
+                    select A.xin_zeng_onu,
+                           A.olt_ming_cheng,
+                           A.olt_duan_kou,
+                           B.wang_yuan_ming_cheng,
+                           B.cao_hao,
+                           B.duan_kou_hao
+                    from jiake_yewu_xinxi as A
+                    left join "wangguan_ONU_zaixianqingdan" as B
+                      on A.xin_zeng_onu = B.onu_ming_cheng
+                    where A.olt_ming_cheng is distinct from B.wang_yuan_ming_cheng
+                       or split_part(A.olt_duan_kou, '-', 1) is distinct from B.cao_hao
+                       or split_part(A.olt_duan_kou, '-', -1) is distinct from B.duan_kou_hao
+                    """
+                )
+                mismatches: List[Dict[str, Any]] = [dict(r) for r in mismatch_rows]
+
+            # Prepare sheet1 rows with side-by-side fields and splits
+            sheet1_rows: List[Dict[str, Any]] = []
+            for r in mismatches:
+                a_port = (r.get("olt_duan_kou") or "")
+                parts = str(a_port).split("-") if a_port is not None else []
+                a_first = parts[0] if len(parts) >= 1 else None
+                a_mid = parts[1] if len(parts) >= 2 else None
+                a_last = parts[-1] if len(parts) >= 1 else None
+                sheet1_rows.append({
+                    "xin_zeng_onu": r.get("xin_zeng_onu"),
+                    "A.olt_ming_cheng": r.get("olt_ming_cheng"),
+                    "B.wang_yuan_ming_cheng": r.get("wang_yuan_ming_cheng"),
+                    "A.olt_duan_kou": r.get("olt_duan_kou"),
+                    "A.cao_hao": a_first,
+                    "B.cao_hao": r.get("cao_hao"),
+                    "A.zhong_jian_kuai": a_mid,
+                    "A.duan_kou_hao": a_last,
+                    "B.duan_kou_hao": r.get("duan_kou_hao"),
+                })
+
+            # Snapshot full table before update for row-wise comparison (sorted by xin_zeng_onu)
+            async with db_pool.acquire() as connb:
+                before_rows_full = await fetch_all_rows(connb, "jiake_yewu_xinxi")
+            def sort_by_onu(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                try:
+                    return sorted(rows, key=lambda r: (str(r.get("xin_zeng_onu") or "")))
+                except Exception:
+                    return rows
+            before_rows_sorted = sort_by_onu(before_rows_full)
+
+            # 2) Apply database corrections on the mismatched rows
+            async with db_pool.acquire() as connu:
+                await connu.execute(
+                    """
+                    update jiake_yewu_xinxi as A
+                    set olt_ming_cheng = B.wang_yuan_ming_cheng,
+                        olt_duan_kou = B.cao_hao || '-' || split_part(A.olt_duan_kou, '-', 2) || '-' || B.duan_kou_hao
+                    from "wangguan_ONU_zaixianqingdan" as B
+                    where A.xin_zeng_onu = B.onu_ming_cheng
+                      and (
+                        A.olt_ming_cheng is distinct from B.wang_yuan_ming_cheng
+                        or split_part(A.olt_duan_kou, '-', 1) is distinct from B.cao_hao
+                        or split_part(A.olt_duan_kou, '-', -1) is distinct from B.duan_kou_hao
+                      )
+                    """
+                )
+
+            # 3) Fetch modified table rows for sheet2
+            async with db_pool.acquire() as connr:
+                modified_rows_full = await fetch_all_rows(connr, "jiake_yewu_xinxi")
+            modified_rows_sorted = sort_by_onu(modified_rows_full)
+            # Align after-rows columns to the same order as before-rows to ensure 1-1 mapping
+            before_cols: List[str] = list(before_rows_sorted[0].keys()) if before_rows_sorted else (list(modified_rows_sorted[0].keys()) if modified_rows_sorted else [])
+            aligned_before_rows: List[Dict[str, Any]] = [{c: r.get(c) for c in before_cols} for r in before_rows_sorted]
+            aligned_after_rows: List[Dict[str, Any]] = [{c: r.get(c) for c in before_cols} for r in modified_rows_sorted]
+
+            # 4) Export a two-sheet Excel with highlights
+            storage_dir = get_storage_dir()
+            export_id = str(uuid.uuid4())
+            ts = datetime.now().strftime("%Y%m%d%H%M%S")
+            safe_base = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff_-]+", "_", f"{display_name}-修正结果").strip("_") or "jiake_fix"
+            filename = f"{safe_base}_{ts}.xlsx"
+            path = os.path.join(storage_dir, filename)
+
+            # Write via pandas, then apply openpyxl formatting
+            with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                # 错误行：按照指定表头中文名称输出
+                df_err = rows_to_df(sheet1_rows)
+                header_labels = {
+                    "xin_zeng_onu": "新增ONU名称",
+                    "A.olt_ming_cheng": "家客信息表OLT名称",
+                    "B.wang_yuan_ming_cheng": "网管OLT名称",
+                    "A.olt_duan_kou": "家客信息表OLT端口",
+                    "A.cao_hao": "家客信息表OLT槽号",
+                    "B.cao_hao": "网管OLT槽号",
+                    "A.zhong_jian_kuai": "家客信息表OLT中间字段",
+                    "A.duan_kou_hao": "家客信息表OLT端口号",
+                    "B.duan_kou_hao": "网管OLT端口号",
+                }
+                if not df_err.empty:
+                    df_err = df_err.rename(columns={k: v for k, v in header_labels.items() if k in df_err.columns})
+                df_err.to_excel(writer, sheet_name="错误行", index=False)
+                # Ensure 修改前/修改后 have identical columns and row order for 1-1 mapping
+                pd.DataFrame(aligned_before_rows, columns=before_cols).to_excel(writer, sheet_name="修改前表", index=False)
+                pd.DataFrame(aligned_after_rows, columns=before_cols).to_excel(writer, sheet_name="修改后表", index=False)
+
+                wb = writer.book
+                red_fill = PatternFill(start_color="FFFF9999", end_color="FFFF9999", fill_type="solid")
+
+                # Highlight mismatched fields in sheet1（基于中文表头）
+                ws1 = wb["错误行"]
+                if sheet1_rows:
+                    headers1 = [cell.value for cell in ws1[1]]
+                    col_idx_map1 = {name: idx + 1 for idx, name in enumerate(headers1)}
+                    pairs = [
+                        ("家客信息表OLT名称", "网管OLT名称"),
+                        ("家客信息表OLT槽号", "网管OLT槽号"),
+                        ("家客信息表OLT端口号", "网管OLT端口号"),
+                    ]
+                    for row_idx in range(2, ws1.max_row + 1):
+                        for left_name, right_name in pairs:
+                            li = col_idx_map1.get(left_name)
+                            ri = col_idx_map1.get(right_name)
+                            if not li or not ri:
+                                continue
+                            lv = ws1.cell(row=row_idx, column=li).value
+                            rv = ws1.cell(row=row_idx, column=ri).value
+                            if (lv or None) != (rv or None):
+                                ws1.cell(row=row_idx, column=li).fill = red_fill
+                                ws1.cell(row=row_idx, column=ri).fill = red_fill
+
+                # Highlight differences between 修改前表 and 修改后表 row-by-row across all columns
+                ws_before = wb["修改前表"]
+                ws_after = wb["修改后表"]
+                if ws_before.max_row == ws_after.max_row and ws_before.max_column == ws_after.max_column:
+                    headers_common = [cell.value for cell in ws_before[1]]
+                    for row_idx in range(2, ws_before.max_row + 1):
+                        for col_idx in range(1, ws_before.max_column + 1):
+                            v_before = ws_before.cell(row=row_idx, column=col_idx).value
+                            v_after = ws_after.cell(row=row_idx, column=col_idx).value
+                            if (v_before or None) != (v_after or None):
+                                ws_before.cell(row=row_idx, column=col_idx).fill = red_fill
+                                ws_after.cell(row=row_idx, column=col_idx).fill = red_fill
+
+            # Register generated file into DB
+            try:
+                async with db_pool.acquire() as connr2:
+                    await ensure_migrations_tables(connr2)
+                    await connr2.execute(
+                        "insert into file_uploads (id, filename, path, size_bytes, content_type, status) values ($1, $2, $3, $4, $5, 'generated')",
+                        uuid.UUID(export_id), filename, path, os.path.getsize(path), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+            except Exception:
+                pass
+
+            export = {"id": export_id, "filename": filename, "path": path}
+        else:
+            export = await export_diffs_excel(added_rows, updated_new_rows, deleted_rows, base_filename=f"{display_name}-差异")
 
         return {
             "datasetKey": dataset_key,
