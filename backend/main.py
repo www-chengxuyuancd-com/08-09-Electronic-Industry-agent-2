@@ -185,9 +185,18 @@ app = FastAPI(
 )
 
 # CORS middleware
+dev_allowed_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=dev_allowed_origins,
+    # Allow common LAN hosts like 192.168.x.x:port during development
+    allow_origin_regex=r"http://(localhost|127\\.0\\.0\\.1|192\\.168\\.[0-9]{1,3}\\.[0-9]{1,3}|10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}|172\\.(1[6-9]|2[0-9]|3[0-1])\\.[0-9]{1,3}\\.[0-9]{1,3}):[0-9]+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
