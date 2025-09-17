@@ -109,21 +109,31 @@ fi
 
 # Python dependencies setup (use existing venv if present; otherwise system Python)
 print_colored "$BLUE" "📦 Checking Python virtual environment..."
-if [ -d "venv" ]; then
+if [ -f "venv/bin/activate" ]; then
     print_colored "$GREEN" "✅ Virtual environment found"
+    VENV_ACTIVATE="venv/bin/activate"
 else
-    print_colored "$YELLOW" "ℹ️ No virtual environment found; will use system Python"
+    if [ -d "venv" ]; then
+        print_colored "$YELLOW" "ℹ️ 'venv' directory exists but no bin/activate; using system Python"
+    else
+        print_colored "$YELLOW" "ℹ️ No virtual environment found; using system Python"
+    fi
 fi
 
 # Install Python dependencies
 print_colored "$BLUE" "📦 Installing Python dependencies..."
-if [ -d "venv" ]; then
-    if source venv/bin/activate && pip install -r requirements.txt; then
+if [ -n "$VENV_ACTIVATE" ] && [ -f "$VENV_ACTIVATE" ]; then
+    if source "$VENV_ACTIVATE" && pip install -r requirements.txt; then
         print_colored "$GREEN" "✅ Python dependencies installed"
         VENV_PYTHON="./venv/bin/python"
     else
-        print_colored "$RED" "❌ Failed to install Python dependencies"
-        exit 1
+        print_colored "$YELLOW" "⚠️ Failed to install deps in venv; falling back to system Python"
+        if $PYTHON_CMD -m pip install -r requirements.txt; then
+            print_colored "$GREEN" "✅ Python dependencies installed (system Python)"
+        else
+            print_colored "$RED" "❌ Failed to install Python dependencies (system Python)"
+            exit 1
+        fi
     fi
 else
     if $PYTHON_CMD -m pip install -r requirements.txt; then
