@@ -107,27 +107,31 @@ else
     print_colored "$GREEN" "✅ .env file already exists"
 fi
 
-# Setup Python virtual environment and install dependencies
-print_colored "$BLUE" "📦 Setting up Python virtual environment..."
-if [ ! -d "venv" ]; then
-    if $PYTHON_CMD -m venv venv; then
-        print_colored "$GREEN" "✅ Virtual environment created"
+# Python dependencies setup (use existing venv if present; otherwise system Python)
+print_colored "$BLUE" "📦 Checking Python virtual environment..."
+if [ -d "venv" ]; then
+    print_colored "$GREEN" "✅ Virtual environment found"
+else
+    print_colored "$YELLOW" "ℹ️ No virtual environment found; will use system Python"
+fi
+
+# Install Python dependencies
+print_colored "$BLUE" "📦 Installing Python dependencies..."
+if [ -d "venv" ]; then
+    if source venv/bin/activate && pip install -r requirements.txt; then
+        print_colored "$GREEN" "✅ Python dependencies installed"
+        VENV_PYTHON="./venv/bin/python"
     else
-        print_colored "$RED" "❌ Failed to create virtual environment"
+        print_colored "$RED" "❌ Failed to install Python dependencies"
         exit 1
     fi
 else
-    print_colored "$GREEN" "✅ Virtual environment already exists"
-fi
-
-# Activate virtual environment and install dependencies
-print_colored "$BLUE" "📦 Installing Python dependencies in virtual environment..."
-if source venv/bin/activate && pip install -r requirements.txt; then
-    print_colored "$GREEN" "✅ Python dependencies installed"
-    VENV_PYTHON="./venv/bin/python"
-else
-    print_colored "$RED" "❌ Failed to install Python dependencies"
-    exit 1
+    if $PYTHON_CMD -m pip install -r requirements.txt; then
+        print_colored "$GREEN" "✅ Python dependencies installed (system Python)"
+    else
+        print_colored "$RED" "❌ Failed to install Python dependencies (system Python)"
+        exit 1
+    fi
 fi
 
 # Install Node.js dependencies
