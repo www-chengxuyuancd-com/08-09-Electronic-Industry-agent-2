@@ -10,12 +10,14 @@ echo ================================================================
 echo  Electronic Industry Agent - Windows Launcher
 echo ================================================================
 
-REM --- Check Python 3.12+ (prefer Windows launcher: py -3.12) ---
+REM --- Check Python 3.12+ (prefer Windows launcher: py -3.13 or -3.12) ---
 set "PY_CMD="
-py -3.12 -V >nul 2>&1 && set "PY_CMD=py -3.12"
+py -3.13 -V >nul 2>&1 && set "PY_CMD=py -3.13"
+if "%PY_CMD%"=="" py -3.12 -V >nul 2>&1 && set "PY_CMD=py -3.12"
 if "%PY_CMD%"=="" (
-  echo [ERROR] Python 3.12+ is required. Please install from https://www.python.org/downloads/
-  echo         Tip: Install the Windows Python launcher and Python 3.12.x
+  echo [ERROR] Python 3.12+ is required (3.12 or 3.13).
+  echo         Please install from https://www.python.org/downloads/
+  echo         Tip: Install the Windows Python launcher and Python 3.13.x or 3.12.x
   pause
   exit /b 1
 )
