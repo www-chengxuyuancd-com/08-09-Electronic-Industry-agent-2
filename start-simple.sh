@@ -13,7 +13,7 @@ fi
 export PYTHONUNBUFFERED=1
 
 echo "Starting backend on http://localhost:8000 ..."
-$PYTHON_CMD -u -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload &
+(cd backend && $PYTHON_CMD -u main.py) &
 
 echo "Starting frontend on http://localhost:3000 ..."
 pnpm dev

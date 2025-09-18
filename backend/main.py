@@ -817,11 +817,12 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
                     break
                 size_bytes += len(chunk)
                 await out.write(chunk)
-        print(f"[diff-upload] key={dataset_key} name={file.filename} size={size_bytes}")
+        # Defer logging until rows are parsed to log row count instead of bytes
 
         # Parse uploaded rows
         new_rows = await parse_tabular_file_to_rows(target_path)
         total_rows = len(new_rows)
+        print(f"[diff-upload] key={dataset_key} name={file.filename} size={total_rows}")
 
         # Fetch existing data
         async with db_pool.acquire() as conn2:
@@ -873,22 +874,17 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
         updated_new_rows = [new_index[k] for k in updated_keys]
         deleted_rows = [old_index[k] for k in deleted_keys]
 
+        # Do not print per-change logs; only log uploaded row count above
+
         # Write-back to DB
         async with db_pool.acquire() as connw:
             await ensure_target_table(connw, target_table, list(new_rows[0].keys()) if new_rows else [])
-            if not unique_columns:
-                # Overwrite strategy: truncate then bulk insert
-                await connw.execute(f'truncate table "{target_table}"')
-                await bulk_insert_rows(connw, target_table, list(new_rows[0].keys()) if new_rows else [], new_rows)
-            else:
-                # Apply changes based on diffs
-                cols = list(new_rows[0].keys()) if new_rows else await get_existing_columns(connw, target_table)
-                for r in added_rows:
-                    await bulk_insert_rows(connw, target_table, cols, [r])
-                for r in updated_new_rows:
-                    await update_row_by_keys(connw, target_table, cols, unique_columns, r)
-                for r in deleted_rows:
-                    await delete_row_by_keys(connw, target_table, unique_columns, r)
+            # Apply upsert-like behavior: add new keys, update existing keys; do not delete others
+            cols = list(new_rows[0].keys()) if new_rows else await get_existing_columns(connw, target_table)
+            for r in added_rows:
+                await bulk_insert_rows(connw, target_table, cols, [r])
+            for r in updated_new_rows:
+                await update_row_by_keys(connw, target_table, cols, unique_columns, r)
 
         # Special post-processing for 家客业务信息表
         if dataset_key == "jiake_yewu_xinxi":
