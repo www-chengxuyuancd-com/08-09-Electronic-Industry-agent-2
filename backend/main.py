@@ -9,7 +9,7 @@ import json
 import re
 import asyncio
 from datetime import datetime
-from typing import Dict, Any, List, Optional, AsyncGenerator, Tuple
+from typing import Dict, Any, List, Optional, AsyncGenerator, Tuple, Set
 from contextlib import asynccontextmanager
 import uuid
 import csv
@@ -641,15 +641,12 @@ async def parse_tabular_file_to_rows(file_path: str) -> List[Dict[str, Any]]:
             headers = [str(h).strip() if h is not None else "" for h in headers]
             # Build pinyin-based columns with underscores
             try:
-                import sys as _sys
-                _utils_dir = os.path.join(os.path.dirname(__file__), "electronic-industry-agent")
-                if _utils_dir not in _sys.path:
-                    _sys.path.append(_utils_dir)
-                from utils import to_pinyin_list as _to_pinyin_list_cols
+                from pinyin_utils import to_pinyin_list as _to_pinyin_list_cols
                 base_names = [h if (h and isinstance(h, str) and h.strip() != "") else f"c_{i}" for i, h in enumerate(headers)]
                 computed_columns = _to_pinyin_list_cols(base_names)
                 computed_columns = [sanitize_identifier(c) for c in computed_columns]
             except Exception:
+                print("failed to import CSV headers by pinyin")
                 computed_columns = [sanitize_identifier(h or f"c_{i}") for i, h in enumerate(headers)]
             for row in reader_sync:
                 normalized = [normalize_value_for_diff(cell) for cell in row]
@@ -685,6 +682,7 @@ async def parse_tabular_file_to_rows(file_path: str) -> List[Dict[str, Any]]:
     header_row = scanned[header_row_index - 1] if scanned else []
     headers = [str(h).strip() if h is not None else "" for h in header_row]
     num_cols = effective_width(header_row)
+    print("Length of Columns: {}, columns: {}".format(num_cols, header_row[:num_cols]))
     if num_cols == 0:
         next_index = header_row_index + 1
         next_rows = list(ws.iter_rows(min_row=next_index, max_row=next_index, max_col=1024, values_only=True))
@@ -700,14 +698,12 @@ async def parse_tabular_file_to_rows(file_path: str) -> List[Dict[str, Any]]:
         data_start_row = header_row_index + 1
     # Build pinyin-based columns with underscores
     try:
-        import sys as _sys
-        _utils_dir = os.path.join(os.path.dirname(__file__), "electronic-industry-agent")
-        if _utils_dir not in _sys.path:
-            _sys.path.append(_utils_dir)
-        from utils import to_pinyin_list as _to_pinyin_list_cols
+        from pinyin_utils import to_pinyin_list as _to_pinyin_list_cols
         base_names = [h if (h and isinstance(h, str) and h.strip() != "") else f"c_{i}" for i, h in enumerate(headers)]
         columns = _to_pinyin_list_cols(base_names)
         columns = [sanitize_identifier(c) for c in columns]
+
+
     except Exception:
         columns = [sanitize_identifier(h or f"c_{i}") for i, h in enumerate(headers)]
     def normalize_row(row_tuple):
@@ -719,6 +715,8 @@ async def parse_tabular_file_to_rows(file_path: str) -> List[Dict[str, Any]]:
         elif len(row_list) > len(columns):
             row_list = row_list[: len(columns)]
         return row_list
+
+    print("Length of New Columns: {}, columns: {}".format(len(columns), columns))
     data_rows_iter = ws.iter_rows(min_row=data_start_row, max_col=len(columns), values_only=True)
     for row in data_rows_iter:
         nr = normalize_row(row)
@@ -824,13 +822,30 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
         total_rows = len(new_rows)
         print(f"[diff-upload] key={dataset_key} name={file.filename} size={total_rows}")
 
-        # Fetch existing data
+        # 基于数据库中“唯一键列”的去重集合来判定是新增还是更新
+        # 说明：与其把整表读出来再比对整行（既耗时也占内存），
+        #      这里只从数据库中查询 unique_columns 的去重值集合（distinct），
+        #      然后用上传数据里的对应唯一键值去命中该集合：命中=更新，不命中=新增。
+        #      一般不会有“删除行”的需求，删除视为 0，不在这里处理。
         async with db_pool.acquire() as conn2:
-            # Ensure target table exists/has columns
+            # 确保目标表存在且列齐全（会根据上传文件的列进行补充）
             detected_columns: List[str] = list(new_rows[0].keys()) if new_rows else []
             await ensure_target_table(conn2, target_table, detected_columns)
-            existing_rows = await fetch_all_rows(conn2, target_table)
+            # 组装并执行 DISTINCT 查询，仅拉取唯一键列的组合值
+            # 注意：unique_columns 在上方将被保证至少有 1 列（若配置缺失，则兜底为首列）
+            existing_key_set: Set[Tuple[Any, ...]] = set()
+            if unique_columns:
+                cols_sql = ", ".join([f'"{c}"' for c in unique_columns])
+                sql_distinct = f'select distinct {cols_sql} from "{target_table}"'
+                rows = await conn2.fetch(sql_distinct)
+                for rec in rows:
+                    # 仅保留唯一键列，构造与 compute_key_tuple 相容的字典
+                    key_row = {c: rec.get(c) for c in unique_columns}
+                    k = compute_key_tuple(key_row, unique_columns)
+                    existing_key_set.add(k)
 
+        print("unique columns: {}".format(unique_columns))
+        print("detected existing key: ".format(len(existing_key_set)))
         # Derive unique columns if not configured
         if not unique_columns:
             if new_rows:
@@ -838,48 +853,51 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
             else:
                 unique_columns = []
 
-        # Index by key
-        new_index: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
-        for r in new_rows:
-            k = compute_key_tuple(r, unique_columns) if unique_columns else tuple(sorted(r.items()))
-            new_index[k] = r
-        old_index: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
-        for r in existing_rows:
-            k = compute_key_tuple(r, unique_columns) if unique_columns else tuple(sorted(r.items()))
-            old_index[k] = r
+        # 注意：不再构建旧数据整行索引 old_index，仅保留唯一键的存在性集合 existing_key_set
 
-        new_keys = set(new_index.keys())
-        old_keys = set(old_index.keys())
-        # Do not sort to avoid comparing heterogeneous key parts (e.g., None vs str)
-        added_keys = list(new_keys - old_keys)
-        deleted_keys = list(old_keys - new_keys)
-        common_keys = new_keys & old_keys
+        # 将上传行划分为：新增/更新/重复（上传文件内部重复）。不再处理“删除”。
+        added_rows: List[Dict[str, Any]] = []
+        updated_new_rows: List[Dict[str, Any]] = []
+        duplicate_count = 0
+        # seen_keys 用于识别“同一批上传数据内部”的重复键，避免重复计算和重复写入
+        seen_keys: set[Tuple[Any, ...]] = set()
 
-        def rows_equal_excluding_keys(a: Dict[str, Any], b: Dict[str, Any], key_cols: List[str]) -> bool:
+        # 取消“操作/状态列”的解析与删除行为识别。业务约定：一般不会有删除行，这里始终视为 0。
+
+        def _rows_equal_excluding_keys(a: Dict[str, Any], b: Dict[str, Any], key_cols: List[str]) -> bool:
             a_norm = {c: normalize_value_for_diff(v) for c, v in a.items() if c not in key_cols}
             b_norm = {c: normalize_value_for_diff(v) for c, v in b.items() if c not in key_cols}
-            # Compare on union of columns
             all_cols = set(a_norm.keys()) | set(b_norm.keys())
             for c in all_cols:
                 if (a_norm.get(c) or None) != (b_norm.get(c) or None):
                     return False
             return True
 
-        updated_keys: List[Tuple[Any, ...]] = []
-        for k in common_keys:
-            if not rows_equal_excluding_keys(new_index[k], old_index[k], unique_columns):
-                updated_keys.append(k)
+        # 遍历上传行：
+        # - 若同一键在本次上传中已出现过，则计入 duplicate_count，跳过
+        # - 若该键存在于数据库的 existing_key_set，则归为“更新”
+        # - 否则归为“新增”
+        for r in new_rows:
+            k = compute_key_tuple(r, unique_columns)
+            if k in seen_keys:
+                duplicate_count += 1
+                continue
+            seen_keys.add(k)
 
-        added_rows = [new_index[k] for k in added_keys]
-        updated_new_rows = [new_index[k] for k in updated_keys]
-        deleted_rows = [old_index[k] for k in deleted_keys]
+            if k in existing_key_set:
+                updated_new_rows.append(r)
+            else:
+                added_rows.append(r)
+
+        # 分类结果日志：仅包含新增、更新、（上传内部）重复；删除固定为 0
+        print(f"[diff-upload][classified] rows={total_rows} add={len(added_rows)} update={len(updated_new_rows)} duplicate={duplicate_count}")
 
         # Do not print per-change logs; only log uploaded row count above
 
         # Write-back to DB
         async with db_pool.acquire() as connw:
             await ensure_target_table(connw, target_table, list(new_rows[0].keys()) if new_rows else [])
-            # Apply upsert-like behavior: add new keys, update existing keys; do not delete others
+            # 根据上面的分类：新增执行插入；已存在的执行更新；不处理删除
             cols = list(new_rows[0].keys()) if new_rows else await get_existing_columns(connw, target_table)
             for r in added_rows:
                 await bulk_insert_rows(connw, target_table, cols, [r])
@@ -1045,7 +1063,8 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
 
             export = {"id": export_id, "filename": filename, "path": path}
         else:
-            export = await export_diffs_excel(added_rows, updated_new_rows, deleted_rows, base_filename=f"{display_name}-差异")
+            # 删除统一视为 0，这里传入空列表以兼容导出函数签名
+            export = await export_diffs_excel(added_rows, updated_new_rows, [], base_filename=f"{display_name}-差异")
 
         return {
             "datasetKey": dataset_key,
@@ -1054,7 +1073,8 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
             "totalRows": total_rows,
             "addedCount": len(added_rows),
             "updatedCount": len(updated_new_rows),
-            "deletedCount": len(deleted_rows),
+            # 业务约定：不处理删除，这里固定返回 0
+            "deletedCount": 0,
             "fileId": export["id"],
             "filename": export["filename"],
             "downloadUrl": f"/api/files/download/{export['id']}",
@@ -1109,11 +1129,7 @@ def compute_pretty_table_name(file_path: str) -> str:
         filtered = 'dataset'
     # Pinyin conversion (lazy import similar to Excel path)
     try:
-        import sys as _sys
-        _utils_dir = os.path.join(os.path.dirname(__file__), 'electronic-industry-agent')
-        if _utils_dir not in _sys.path:
-            _sys.path.append(_utils_dir)
-        from utils import to_pinyin_list as _to_pinyin_list_name
+        from pinyin_utils import to_pinyin_list as _to_pinyin_list_name
         pinyin_res = _to_pinyin_list_name([filtered])
         name = pinyin_res[0] if pinyin_res else 'dataset'
     except Exception:
@@ -1377,11 +1393,7 @@ async def import_excel_background(upload_id: str, file_path: str) -> None:
 
             # Build column names using Pinyin conversion utility
             try:
-                import sys as _sys
-                _utils_dir = os.path.join(os.path.dirname(__file__), "electronic-industry-agent")
-                if _utils_dir not in _sys.path:
-                    _sys.path.append(_utils_dir)
-                from utils import to_pinyin_list as _to_pinyin_list
+                from pinyin_utils import to_pinyin_list as _to_pinyin_list
             except Exception as e:
                 print(f"[xlsx] warn: failed to import to_pinyin_list: {e}")
                 def _to_pinyin_list(words, exclude_chars=['%']):
