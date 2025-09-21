@@ -9,7 +9,7 @@ import json
 import re
 import asyncio
 from datetime import datetime
-from typing import Dict, Any, List, Optional, AsyncGenerator, Tuple, Set
+from typing import Dict, Any, List, Optional, AsyncGenerator, Tuple, Set, Callable, Awaitable
 from contextlib import asynccontextmanager
 import uuid
 import csv
@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
+from openpyxl import Workbook
 
 # Load environment variables
 load_dotenv()
@@ -600,17 +601,70 @@ def rows_to_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=cols)
 
 # 导出差异 Excel：分别输出“新增/修改/删除”三个工作表，并登记到库
-async def export_diffs_excel(added: List[Dict[str, Any]], updated_new: List[Dict[str, Any]], deleted: List[Dict[str, Any]], base_filename: str) -> Dict[str, str]:
+async def export_diffs_excel(
+    added: List[Dict[str, Any]],
+    updated_new: List[Dict[str, Any]],
+    deleted: List[Dict[str, Any]],
+    base_filename: str,
+    progress_cb: Optional[Callable[[str, int, int], Awaitable[None]]] = None,
+) -> Dict[str, str]:
+    """Export diffs to an Excel file with incremental writes and optional progress callback.
+
+    Progress callback signature: (stage: str, done: int, total: int)
+    Stages include per-sheet names like "新增", "修改", "删除".
+    """
     storage_dir = get_storage_dir()
     export_id = str(uuid.uuid4())
     ts = datetime.now().strftime("%Y%m%d%H%M%S")
     safe_base = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff_-]+", "_", base_filename).strip("_") or "diff"
     filename = f"{safe_base}_{ts}.xlsx"
     path = os.path.join(storage_dir, filename)
-    with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        rows_to_df(added).to_excel(writer, sheet_name="新增", index=False)
-        rows_to_df(updated_new).to_excel(writer, sheet_name="修改", index=False)
-        rows_to_df(deleted).to_excel(writer, sheet_name="删除", index=False)
+
+    async def _report(stage: str, done: int, total: int) -> None:
+        try:
+            if progress_cb:
+                await progress_cb(stage, done, total)
+            else:
+                print(f"[export-diffs][{stage}] {done}/{total}", flush=True)
+        except Exception:
+            # Do not fail export on progress errors
+            pass
+
+    def _columns_for_rows(rows: List[Dict[str, Any]]) -> List[str]:
+        if not rows:
+            return []
+        return list(rows[0].keys())
+
+    # Use openpyxl write-only mode for streaming rows to reduce memory and enable progress
+    wb = Workbook(write_only=True)
+
+    sheets_spec: List[Tuple[str, List[Dict[str, Any]]]] = [
+        ("新增", added),
+        ("修改", updated_new),
+        ("删除", deleted),
+    ]
+
+    chunk_size = 2000
+    for sheet_name, rows in sheets_spec:
+        ws = wb.create_sheet(title=sheet_name)
+        cols = _columns_for_rows(rows)
+        if cols:
+            ws.append(cols)
+        total = len(rows)
+        if total == 0:
+            await _report(sheet_name, 0, 0)
+            continue
+        done = 0
+        for i in range(0, total, chunk_size):
+            batch = rows[i:i + chunk_size]
+            for r in batch:
+                ws.append([r.get(c) for c in cols])
+            done = min(total, i + len(batch))
+            await _report(sheet_name, done, total)
+
+    # Save workbook to file
+    wb.save(path)
+
     # record in DB
     global db_pool
     if db_pool:
