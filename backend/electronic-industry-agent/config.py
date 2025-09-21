@@ -59,12 +59,12 @@ DATASET_PRESETS = {
     "ziguan_onu_guangmao": {
         "display_name": "资管-ONU光猫用户",
         "target_table": "ziguan_ONU_guangmao",
-        "unique_columns": ["zi_yuan_wei_yi_biao_zhi"],
+        "unique_columns": ["zi_yuan_wei_yi_biao_shi"],
     },
     "ziguan_pon_wangluo": {
         "display_name": "资管-PON网络连接",
         "target_table": "ziguan_PON_wangluo",
-        "unique_columns": ["zi_yuan_wei_yi_biao_zhi"],
+        "unique_columns": ["zi_yuan_wei_yi_biao_shi"],
     },
     "ziguan_fenguangqi": {
         "display_name": "资管-分光器",
