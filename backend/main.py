@@ -156,6 +156,7 @@ def build_intent_prompt(user_input: str) -> str:
 # Global database connection pool
 db_pool: Optional[asyncpg.Pool] = None
 
+# 应用生命周期管理器：负责启动时创建数据库连接池，关闭时安全释放，保证后台任务可用性
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
@@ -177,6 +178,7 @@ async def lifespan(app: FastAPI):
         print("Database connection pool closed")
 
 # FastAPI app
+# 创建 FastAPI 应用：配置标题、描述、版本与生命周期钩子
 app = FastAPI(
     title="Electronic Industry Agent Backend",
     description="Python backend for Electronic Industry Agent",
@@ -192,6 +194,7 @@ dev_allowed_origins = [
     "http://127.0.0.1:3001",
 ]
 
+# 跨域设置：允许本地与局域网调试访问，方法与头部均放开
 app.add_middleware(
     CORSMiddleware,
     allow_origins=dev_allowed_origins,
@@ -203,6 +206,7 @@ app.add_middleware(
 )
 
 # Pydantic models
+# 模型定义：用于接口的请求/响应校验与自动文档生成，便于前后端契约对齐
 class LLMRequest(BaseModel):
     userInput: str = Field(..., description="User input for LLM processing")
     modelType: str = Field(default="deepseek", description="LLM model type")
@@ -276,6 +280,7 @@ class DatasetDiffResponse(BaseModel):
     uniqueColumns: List[str]
 
 # Utility functions
+# SQL 清洗：移除 Markdown 代码块包装与冗余空白，确保可直接执行
 def clean_sql_query(sql: str) -> str:
     """Clean SQL query by removing markdown code blocks and extra whitespace"""
     if not sql or not isinstance(sql, str):
@@ -294,6 +299,7 @@ def clean_sql_query(sql: str) -> str:
     
     return cleaned_sql
 
+# SQL 校验：仅允许只读查询（SELECT/WITH），屏蔽增删改等危险操作
 def validate_sql_query(sql: str) -> Dict[str, Any]:
     """Validate SQL query for safety"""
     if not sql or not isinstance(sql, str):
@@ -323,6 +329,7 @@ def validate_sql_query(sql: str) -> Dict[str, Any]:
     
     return {"isValid": True}
 
+# 结果序列化：将 datetime 等类型转换为可 JSON 化的形式
 def serialize_db_result(data: Any) -> Any:
     """Serialize database results, handling datetime and other types"""
     if data is None:
@@ -339,6 +346,7 @@ def serialize_db_result(data: Any) -> Any:
     
     return data
 
+# 执行查询（返回字典列表）：统一连接池获取/释放与结果序列化
 async def execute_query_dicts(sql: str, params: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
     """Execute a SQL query and return list of dict rows."""
     global db_pool
@@ -352,6 +360,7 @@ async def execute_query_dicts(sql: str, params: Optional[List[Any]] = None) -> L
             result.append(serialize_db_result(dict(r)))
         return result
 
+# 导出结果为 Excel：按首行列顺序写入，并登记到 file_uploads 便于下载
 async def export_rows_to_excel(rows: List[Dict[str, Any]], base_filename: str) -> Dict[str, str]:
     """Export rows to an Excel file under storage dir. Returns dict with id, filename, path."""
     if not rows:
@@ -383,6 +392,7 @@ async def export_rows_to_excel(rows: List[Dict[str, Any]], base_filename: str) -
             pass
     return {"id": export_id, "filename": filename, "path": path}
 
+# 简易意图识别（兜底）：基于关键词判断 OLT 统计 / FTTR 鉴别 / 未知
 def recognize_task_from_text(text: str) -> str:
     """Return one of: 'OLT_STATISTICS', 'FTTR_CHECK', or 'UNKNOWN'"""
     t = (text or "").lower()
@@ -392,6 +402,7 @@ def recognize_task_from_text(text: str) -> str:
         return "FTTR_CHECK"
     return "UNKNOWN"
 
+# 二级分光器名称抽取：支持引号内容、中文括号与包含 '/' 的模式
 def extract_erji_fenguang_name(text: str) -> Optional[str]:
     """Extract 二级分光器名称 from free text.
     Improvements:
@@ -419,6 +430,7 @@ def extract_erji_fenguang_name(text: str) -> Optional[str]:
         return candidate if candidate else None
     return None
 
+# ONU 名称抽取：优先匹配“ONU用户/ONU”后引号内的名称
 def extract_onu_name(text: str) -> Optional[str]:
     """Extract ONU用户名称 from free text.
     - Prefer names inside quotes near keywords like ONU/ONU用户
@@ -501,6 +513,7 @@ FTTR_ONU_SQL_TEMPLATE = (
     "  and C.yun_xing_zhuang_tai = '在线'\n"
 )
 
+# 基于 LLM 的意图识别构建 SQL 模板：优先返回可直接预览/流式输出的模板
 async def build_sql_for_intent(text: str, provider: Optional[str] = None) -> Dict[str, Any]:
     """Use LLM to recognize intent and build default SQL template for preview/stream."""
     llm_res = await recognize_intent_via_llm(text, provider)
@@ -540,6 +553,7 @@ async def build_sql_for_intent(text: str, provider: Optional[str] = None) -> Dic
         return {"task": task_type, "sql": FTTR_FGQ_SQL_TEMPLATE, "params": params, "alternative": FTTR_ONU_SQL_TEMPLATE}
     return {"task": "UNKNOWN", "sql": "", "message": "未识别到任务"}
 
+# 文件存储目录：统一集中到项目内 electronic-industry-agent/files
 def get_storage_dir() -> str:
     base_dir = os.path.dirname(__file__)
     storage = os.path.join(base_dir, "electronic-industry-agent", "files")
@@ -548,6 +562,7 @@ def get_storage_dir() -> str:
 
 DATASET_PRESETS: Dict[str, Dict[str, Any]] = CONFIG_DATASET_PRESETS or {}
 
+# 数据集配置读取：从预设中取得显示名/目标表/唯一列配置
 def get_dataset_config(dataset_key: str) -> Dict[str, Any]:
     preset = DATASET_PRESETS.get(dataset_key)
     if not preset:
@@ -559,6 +574,7 @@ def get_dataset_config(dataset_key: str) -> Dict[str, Any]:
         "unique_columns": list(preset.get("unique_columns") or []),
     }
 
+# 差异比对值标准化：空白归一为 None，便于去重与对齐
 def normalize_value_for_diff(value: Any) -> Optional[str]:
     if value is None:
         return None
@@ -568,12 +584,14 @@ def normalize_value_for_diff(value: Any) -> Optional[str]:
         return None
     return s
 
+# 基于唯一键列生成键值元组：用于判定新增/更新/重复
 def compute_key_tuple(row: Dict[str, Any], unique_columns: List[str]) -> Tuple[Any, ...]:
     parts: List[Any] = []
     for c in unique_columns:
         parts.append(normalize_value_for_diff(row.get(c)))
     return tuple(parts)
 
+# 将行列表转为 DataFrame：保持首行列顺序，导出更稳定
 def rows_to_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
@@ -581,6 +599,7 @@ def rows_to_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     cols = list(rows[0].keys())
     return pd.DataFrame(rows, columns=cols)
 
+# 导出差异 Excel：分别输出“新增/修改/删除”三个工作表，并登记到库
 async def export_diffs_excel(added: List[Dict[str, Any]], updated_new: List[Dict[str, Any]], deleted: List[Dict[str, Any]], base_filename: str) -> Dict[str, str]:
     storage_dir = get_storage_dir()
     export_id = str(uuid.uuid4())
@@ -606,6 +625,7 @@ async def export_diffs_excel(added: List[Dict[str, Any]], updated_new: List[Dict
             pass
     return {"id": export_id, "filename": filename, "path": path}
 
+# 表存在性检测：使用 to_regclass 判定是否存在
 async def table_exists(connection: asyncpg.Connection, table_name: str) -> bool:
     q = "select to_regclass($1) is not null as exists"
     try:
@@ -614,6 +634,7 @@ async def table_exists(connection: asyncpg.Connection, table_name: str) -> bool:
     except Exception:
         return False
 
+# 拉取整表所有行（谨慎用于小表/快照场景），自动处理引号
 async def fetch_all_rows(connection: asyncpg.Connection, table_name: str) -> List[Dict[str, Any]]:
     try:
         rows = await connection.fetch(f'select * from "{table_name}"')
@@ -626,11 +647,14 @@ async def fetch_all_rows(connection: asyncpg.Connection, table_name: str) -> Lis
         except Exception:
             return []
 
+# 通用表格解析：支持 CSV/Excel，自动探测表头与生成安全列名
 async def parse_tabular_file_to_rows(file_path: str) -> List[Dict[str, Any]]:
     # Handle CSV or Excel (first sheet)
     suffix = pathlib.Path(file_path).suffix.lower()
     rows: List[Dict[str, Any]] = []
+    # 根据扩展名选择解析逻辑：CSV 与 Excel 走不同分支，输出统一的字典行列表
     if suffix == ".csv":
+        # 优先尝试多种常见编码以避免解码错误（utf-8/gbk/latin1 等）
         enc = _detect_csv_encoding(file_path)
         with open(file_path, mode="r", encoding=enc, newline="") as f_sync:
             reader_sync = csv.reader(f_sync)
@@ -638,17 +662,20 @@ async def parse_tabular_file_to_rows(file_path: str) -> List[Dict[str, Any]]:
                 headers = next(reader_sync)
             except StopIteration:
                 return []
+            # 统一表头：去两端空白，缺失置空字符串，便于后续生成列名
             headers = [str(h).strip() if h is not None else "" for h in headers]
             # Build pinyin-based columns with underscores
             try:
                 from pinyin_utils import to_pinyin_list as _to_pinyin_list_cols
                 base_names = [h if (h and isinstance(h, str) and h.strip() != "") else f"c_{i}" for i, h in enumerate(headers)]
                 computed_columns = _to_pinyin_list_cols(base_names)
+                # 二次清洗：确保列名只包含安全字符并转为下划线风格
                 computed_columns = [sanitize_identifier(c) for c in computed_columns]
             except Exception:
                 print("failed to import CSV headers by pinyin")
                 computed_columns = [sanitize_identifier(h or f"c_{i}") for i, h in enumerate(headers)]
             for row in reader_sync:
+                # 单元格标准化：空白统一为 None，便于后续对比与入库
                 normalized = [normalize_value_for_diff(cell) for cell in row]
                 if all(v is None for v in normalized):
                     continue
@@ -660,6 +687,7 @@ async def parse_tabular_file_to_rows(file_path: str) -> List[Dict[str, Any]]:
                 rows.append({computed_columns[i]: normalized[i] for i in range(len(computed_columns))})
         return rows
     # Excel
+    # 延迟导入以减少无关依赖；只读取首个工作表的数据
     from openpyxl import load_workbook
     wb = load_workbook(filename=file_path, read_only=True, data_only=True)
     ws = wb.worksheets[0]
@@ -671,6 +699,7 @@ async def parse_tabular_file_to_rows(file_path: str) -> List[Dict[str, Any]]:
             if v is not None and str(v).strip() != "":
                 last_idx = idx
         return last_idx + 1
+    # 扫描前 50 行用于定位最可能的表头行，并估算有效列宽
     scanned = list(ws.iter_rows(min_row=1, max_row=50, max_col=1024, values_only=True))
     header_row_index = 1
     header_non_empty = 0
@@ -701,12 +730,14 @@ async def parse_tabular_file_to_rows(file_path: str) -> List[Dict[str, Any]]:
         from pinyin_utils import to_pinyin_list as _to_pinyin_list_cols
         base_names = [h if (h and isinstance(h, str) and h.strip() != "") else f"c_{i}" for i, h in enumerate(headers)]
         columns = _to_pinyin_list_cols(base_names)
+        # 列名安全化：移除非法字符并统一为小写下划线风格
         columns = [sanitize_identifier(c) for c in columns]
 
 
     except Exception:
         columns = [sanitize_identifier(h or f"c_{i}") for i, h in enumerate(headers)]
     def normalize_row(row_tuple):
+        # 将整行转换为统一格式：空白为 None，长度对齐到列数
         row_list = [normalize_value_for_diff(cell) for cell in row_tuple]
         if all(v is None for v in row_list):
             return None
@@ -729,6 +760,7 @@ async def parse_tabular_file_to_rows(file_path: str) -> List[Dict[str, Any]]:
         pass
     return rows
 
+# 查询现有列顺序：用于增量添加缺失列
 async def get_existing_columns(connection: asyncpg.Connection, table_name: str) -> List[str]:
     try:
         rows = await connection.fetch(
@@ -744,6 +776,7 @@ async def get_existing_columns(connection: asyncpg.Connection, table_name: str) 
     except Exception:
         return []
 
+# 确保目标表存在且列齐：不存在则建表，存在则补齐缺失列
 async def ensure_target_table(connection: asyncpg.Connection, table_name: str, columns: List[str]) -> None:
     if not columns:
         return
@@ -759,6 +792,7 @@ async def ensure_target_table(connection: asyncpg.Connection, table_name: str, c
             except Exception:
                 pass
 
+# 批量插入：按给定列顺序批量写入，提高导入效率
 async def bulk_insert_rows(connection: asyncpg.Connection, table_name: str, columns: List[str], rows: List[Dict[str, Any]]) -> int:
     if not rows:
         return 0
@@ -770,6 +804,7 @@ async def bulk_insert_rows(connection: asyncpg.Connection, table_name: str, colu
     await connection.executemany(insert_sql, values_batches)
     return len(rows)
 
+# 以唯一键为条件的更新：仅更新非键列，参数化防注入
 async def update_row_by_keys(connection: asyncpg.Connection, table_name: str, all_columns: List[str], key_columns: List[str], row: Dict[str, Any]) -> None:
     set_columns = [c for c in all_columns if c not in key_columns]
     if not set_columns:
@@ -780,6 +815,7 @@ async def update_row_by_keys(connection: asyncpg.Connection, table_name: str, al
     params: List[Any] = [normalize_value_for_diff(row.get(c)) for c in set_columns] + [normalize_value_for_diff(row.get(k)) for k in key_columns]
     await connection.execute(sql, *params)
 
+# 以唯一键为条件的删除：当前主要用于对比类流程的占位
 async def delete_row_by_keys(connection: asyncpg.Connection, table_name: str, key_columns: List[str], row: Dict[str, Any]) -> None:
     if not key_columns:
         return
@@ -788,6 +824,7 @@ async def delete_row_by_keys(connection: asyncpg.Connection, table_name: str, ke
     params: List[Any] = [normalize_value_for_diff(row.get(k)) for k in key_columns]
     await connection.execute(sql, *params)
 
+# 数据集对比上传：解析上传文件与库内唯一键集合比对，输出新增/更新并落库
 @app.post("/api/datasets/{dataset_key}/diff-upload", response_model=DatasetDiffResponse)
 async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
     global db_pool
@@ -796,6 +833,7 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
     if not file:
         raise HTTPException(status_code=400, detail="缺少上传文件")
     try:
+        # 第一步：读取数据集配置与确保元表存在
         async with db_pool.acquire() as conn:
             await ensure_migrations_tables(conn)
             cfg = get_dataset_config(dataset_key)
@@ -827,6 +865,7 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
         #      这里只从数据库中查询 unique_columns 的去重值集合（distinct），
         #      然后用上传数据里的对应唯一键值去命中该集合：命中=更新，不命中=新增。
         #      一般不会有“删除行”的需求，删除视为 0，不在这里处理。
+        # 第二步：构建库内唯一键“存在性集合”，用以判定新增/更新
         async with db_pool.acquire() as conn2:
             # 确保目标表存在且列齐全（会根据上传文件的列进行补充）
             detected_columns: List[str] = list(new_rows[0].keys()) if new_rows else []
@@ -877,6 +916,7 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
         # - 若同一键在本次上传中已出现过，则计入 duplicate_count，跳过
         # - 若该键存在于数据库的 existing_key_set，则归为“更新”
         # - 否则归为“新增”
+        # 第三步：遍历上传数据，利用 existing_key_set 判定类别
         for r in new_rows:
             k = compute_key_tuple(r, unique_columns)
             if k in seen_keys:
@@ -895,6 +935,7 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
         # Do not print per-change logs; only log uploaded row count above
 
         # Write-back to DB
+        # 第四步：回写数据库——新增批量插入，更新按唯一键参数化更新
         async with db_pool.acquire() as connw:
             await ensure_target_table(connw, target_table, list(new_rows[0].keys()) if new_rows else [])
             # 根据上面的分类：新增执行插入；已存在的执行更新；不处理删除
@@ -1091,6 +1132,7 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
             "traceback": tb,
         })
 
+# SQL 标识符清洗：转为安全的下划线小写形式，避免非法字符
 def sanitize_identifier(name: str) -> str:
     cleaned = re.sub(r"[^0-9a-zA-Z_]+", "_", name.strip())
     cleaned = re.sub(r"_+", "_", cleaned)
@@ -1104,6 +1146,7 @@ def sanitize_identifier(name: str) -> str:
 def _is_chinese_char(ch: str) -> bool:
     return '\u4e00' <= ch <= '\u9fff'
 
+# 依据文件名生成可读表名：去除 UUID/时间戳，仅保留中文/字母/连字符并转拼音
 def compute_pretty_table_name(file_path: str) -> str:
     """Derive a pinyin-based table name from filename by:
     - Removing leading UUID and underscore
@@ -1139,6 +1182,7 @@ def compute_pretty_table_name(file_path: str) -> str:
     name = re.sub(r'_+', '_', name).strip('_').lower()
     return name or 'dataset'
 
+# 确保内部元表存在：file_uploads 与 csv_metadata，用于文件登记与结构复用
 async def ensure_migrations_tables(connection: asyncpg.Connection) -> None:
     await connection.execute(
         """
@@ -1173,6 +1217,7 @@ def _try_read_csv_headers(file_path: str, encoding: str):
         headers = next(reader_sync)
         return headers
 
+# CSV 编码探测：按常见编码列表尝试读取表头并回退
 def _detect_csv_encoding(file_path: str) -> str:
     """Best-effort CSV encoding detection with sensible fallbacks."""
     candidate_encodings = [
@@ -1198,11 +1243,13 @@ def _detect_csv_encoding(file_path: str) -> str:
     # Last resort
     return "utf-8"
 
+# CSV 后台导入：按表头结构复用/创建数据表，分批插入并登记状态
 async def import_csv_background(upload_id: str, file_path: str) -> None:
     global db_pool
     if not db_pool:
         return
     try:
+        # 标记导入状态并准备表结构/元数据
         async with db_pool.acquire() as conn:
             await ensure_migrations_tables(conn)
             await conn.execute(
@@ -1215,6 +1262,7 @@ async def import_csv_background(upload_id: str, file_path: str) -> None:
             # Detect encoding and read headers
             detected_encoding = _detect_csv_encoding(file_path)
             print(f"[csv] start id={upload_id} path={file_path} encoding={detected_encoding}")
+            # 单次读取表头用于生成“结构签名”，后续可复用相同结构的数据表
             with open(file_path, mode="r", encoding=detected_encoding, newline="") as f_sync:
                 reader_sync = csv.reader(f_sync)
                 headers = next(reader_sync)
@@ -1243,7 +1291,7 @@ async def import_csv_background(upload_id: str, file_path: str) -> None:
                 # Ensure table exists with expected columns
                 column_defs_existing = ", ".join([f'"{c}" text' for c in columns])
                 await conn.execute(f'create table if not exists "{table_name}" ({column_defs_existing});')
-                # Truncate existing table for overwrite
+                # 同结构覆盖导入：截断旧数据，避免重复
                 await conn.execute(f'truncate table "{table_name}"')
                 print(f"[csv] reuse table={table_name} (truncate)")
             else:
@@ -1275,6 +1323,7 @@ async def import_csv_background(upload_id: str, file_path: str) -> None:
             batch_size = 1000
             insert_sql = f'insert into "{table_name}" ({", ".join([f"\"{c}\"" for c in columns])}) values ({", ".join([f"${i+1}" for i in range(len(columns))])})'
 
+            # 将 CSV 数据分批（1000 行）插入，控制事务体量与内存
             def chunked(iterable, size):
                 chunk: List[List[Optional[str]]] = []
                 for row in iterable:
@@ -1285,6 +1334,7 @@ async def import_csv_background(upload_id: str, file_path: str) -> None:
                 if chunk:
                     yield chunk
 
+            # 二次读取文件（跳过表头），对齐列数并将空字符串规范为 NULL
             with open(file_path, mode="r", encoding=detected_encoding, newline="") as f_sync:
                 reader_sync = csv.reader(f_sync)
                 next(reader_sync)
@@ -1318,12 +1368,14 @@ async def import_csv_background(upload_id: str, file_path: str) -> None:
             pass
         print(f"CSV import failed: {e}")
 
+# Excel 后台导入：智能识别表头行与有效列宽，转安全列名后批量写入
 async def import_excel_background(upload_id: str, file_path: str) -> None:
     """Import first sheet of an Excel file as text columns."""
     global db_pool
     if not db_pool:
         return
     try:
+        # 标记导入状态，随后构建/复用数据表结构
         async with db_pool.acquire() as conn:
             await ensure_migrations_tables(conn)
             await conn.execute(
@@ -1358,6 +1410,7 @@ async def import_excel_background(upload_id: str, file_path: str) -> None:
                 return last_idx + 1
             # For large files, some generators write an incorrect dimension (e.g., A1:A1).
             # Avoid relying on ws.max_row/ws.max_column: read a wide column range and trim trailing empties.
+            # 限定扫描范围，兼顾性能与鲁棒性
             max_scan_rows = 50
             scanned = list(ws.iter_rows(min_row=1, max_row=max_scan_rows, max_col=1024, values_only=True))
 
@@ -1447,6 +1500,7 @@ async def import_excel_background(upload_id: str, file_path: str) -> None:
 
             insert_sql = f'insert into "{table_name}" ({", ".join([f"\"{c}\"" for c in columns])}) values ({", ".join([f"${i+1}" for i in range(len(columns))])})'
 
+            # 以生成器形式按批次聚合行，避免一次性加载全部数据
             def chunked_rows(iterator, size):
                 chunk: List[List[Optional[str]]] = []
                 for row in iterator:
@@ -1460,6 +1514,7 @@ async def import_excel_background(upload_id: str, file_path: str) -> None:
             rows_imported = 0
             batch_size = 1000
 
+            # 逐行规范化：转字符串去空白，空值置 None，并裁剪/填充到固定列数
             def normalize_row(row_tuple):
                 row_list = [
                     (str(cell).strip() if cell is not None and str(cell).strip() != "" else None)
@@ -1490,6 +1545,7 @@ async def import_excel_background(upload_id: str, file_path: str) -> None:
                 if len(preview) > 1:
                     print(f"[xlsx] sample_row_2={preview[1]}")
 
+            # 使用独立连接批量写入，优先插入两行预览样本便于快速确认
             async with db_pool.acquire() as conn2:
                 if preview:
                     await conn2.executemany(insert_sql, preview)
@@ -1522,6 +1578,7 @@ async def import_excel_background(upload_id: str, file_path: str) -> None:
 
 
 # LLM clients
+# OpenAI 客户端：封装超时与重试，提供标准与流式输出
 class OpenAIClient:
     """OpenAI API client"""
     
@@ -1615,6 +1672,7 @@ class OpenAIClient:
                     raise HTTPException(status_code=500, detail=f"OpenAI API Error: {e.__class__.__name__}: {str(e)}")
                 raise HTTPException(status_code=500, detail=f"OpenAI API Error: {e.__class__.__name__}: {str(e)}")
 
+# Gemini 客户端：简单封装，提供“伪流式”分片输出
 class GeminiClient:
     """Gemini API client"""
     
@@ -1664,6 +1722,7 @@ class GeminiClient:
             yield chunk
             await asyncio.sleep(0.01)  # Small delay to simulate streaming
 
+# DeepSeek 客户端：兼容 OpenAI Chat Completions 接口与流式输出
 class DeepSeekClient:
     """DeepSeek API client (OpenAI-compatible chat completions)."""
     
@@ -1754,6 +1813,7 @@ class DeepSeekClient:
                 raise HTTPException(status_code=500, detail=f"DeepSeek API Error: {e.__class__.__name__}: {str(e)}")
 
 # API endpoints
+# LLM 客户端工厂：按 provider 选择对应实现，默认 DeepSeek
 def get_llm_client(provider: Optional[str] = None):
     name = (provider or LLM_PROVIDER or "deepseek").lower()
     if name == "openai":
@@ -1762,6 +1822,7 @@ def get_llm_client(provider: Optional[str] = None):
         return GeminiClient()
     return DeepSeekClient()
 
+# 调用 LLM 做意图识别：强制 JSON 输出并做健壮性清洗
 async def recognize_intent_via_llm(text: str, provider: Optional[str] = None) -> Dict[str, Any]:
     client = get_llm_client(provider)
     prompt = build_intent_prompt(text)
@@ -1790,11 +1851,13 @@ async def recognize_intent_via_llm(text: str, provider: Optional[str] = None) ->
         # Fallback: no tasks
         return {"tasks": []}
 
+# 根路由：用于服务可用性与版本验证
 @app.get("/")
 async def root():
     """Root endpoint"""
     return {"message": "Electronic Industry Agent Backend", "version": "1.0.0"}
 
+# 简单 LLM 接口：仅返回固定 SQL 模板（不做自由生成）
 @app.post("/api/call-llm")
 async def call_llm(request: LLMRequest):
     """Return fixed SQL templates based on intent recognition (no free-form generation)."""
@@ -1810,6 +1873,7 @@ async def call_llm(request: LLMRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM处理错误: {e.__class__.__name__}: {str(e)}")
 
+# 流式 LLM 接口：先返回“思考”再按块推送 SQL 模板
 @app.post("/api/call-llm-stream")
 async def call_llm_stream(request: LLMStreamRequest):
     """Stream fixed SQL template chunks based on intent (UTF-8 JSON, unescaped)."""
@@ -1858,6 +1922,7 @@ async def call_llm_stream(request: LLMStreamRequest):
         }
     )
 
+# 意图识别接口：返回 OLT 统计/FTTR 鉴别任务以及抽取的参数
 @app.post("/api/intent/recognize", response_model=IntentResponse)
 async def recognize_intent(request: IntentRequest):
     """LLM-based intent recognition for OLT统计 and FTTR鉴别."""
@@ -1871,6 +1936,7 @@ async def recognize_intent(request: IntentRequest):
         tasks = [IntentTask(type="OLT_STATISTICS", params={}), IntentTask(type="FTTR_CHECK", params={})]
     return {"tasks": tasks}
 
+# 意图执行接口：自动识别后直接执行对应任务并返回完整结果
 @app.post("/api/intent/execute")
 async def execute_intent(request: IntentRequest):
     """Execute intent end-to-end: use LLM for intent, then run the appropriate task.
@@ -1894,6 +1960,7 @@ async def execute_intent(request: IntentRequest):
         return await task_olt_statistics()
     raise HTTPException(status_code=400, detail="未识别到可执行的任务类型")
 
+# SQL 查询执行端点：清洗与校验 SQL，只允许只读查询，返回数据/实体信息/推荐
 @app.post("/api/sql-query")
 async def execute_sql_query(request: SQLQueryRequest):
     """Execute SQL query"""
@@ -1906,7 +1973,7 @@ async def execute_sql_query(request: SQLQueryRequest):
         if not request.sql:
             raise HTTPException(status_code=400, detail="缺少SQL查询语句")
         
-        # Clean and validate SQL
+        # 第一步：清洗/校验 SQL，只允许只读查询（SELECT/WITH）
         cleaned_sql = clean_sql_query(request.sql)
         
         if not cleaned_sql:
@@ -1916,7 +1983,7 @@ async def execute_sql_query(request: SQLQueryRequest):
         if not validation["isValid"]:
             raise HTTPException(status_code=400, detail=validation.get("error", "SQL查询语句无效"))
         
-        # Execute query
+        # 第二步：执行查询并序列化结果
         async with db_pool.acquire() as connection:
             try:
                 result = await connection.fetch(cleaned_sql)
@@ -1927,7 +1994,7 @@ async def execute_sql_query(request: SQLQueryRequest):
                     row_dict = dict(row)
                     data.append(serialize_db_result(row_dict))
 
-                # Try to infer entity meta if not provided in request
+                # 第三步：若未显式传入实体信息，尝试基于 SQL 文本推断实体类型与名称
                 entity_type = request.entityType
                 entity_name = request.entityName
                 try:
@@ -1959,7 +2026,7 @@ async def execute_sql_query(request: SQLQueryRequest):
                 except Exception:
                     pass
 
-                # Optional: if ONU case has no support, compute same-room recommendations
+                # 第四步（可选）：若为 ONU 且不支持 CG 口，基于机房给出同机房推荐列表
                 recommendations: List[Dict[str, Any]] = []
                 try:
                     def _support_flag_js(rec: Dict[str, Any]) -> bool:
@@ -2006,7 +2073,7 @@ async def execute_sql_query(request: SQLQueryRequest):
                 except Exception:
                     pass
 
-                # Return enriched response while keeping compatibility by nesting rows under 'data'
+                # 返回结构：data 为结果数组，同时附带 entityType/entityName 与 recommendations
                 return {
                     "data": data,
                     "entityType": entity_type,
@@ -2022,6 +2089,7 @@ async def execute_sql_query(request: SQLQueryRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"处理请求时发生错误: {str(e)}")
 
+# SQL 查询导出端点：执行查询后整表导出为 Excel 并提供下载
 @app.post("/api/sql-query/export", response_model=SQLExportResponse)
 async def export_sql_query(request: SQLQueryRequest):
     """Execute a SQL query and export full result to Excel, return download info."""
@@ -2045,6 +2113,7 @@ async def export_sql_query(request: SQLQueryRequest):
         "rowCount": len(rows),
     }
 
+# 任务：OLT 统计——按照机房统计低效 OLT 台数并导出
 @app.post("/api/tasks/olt-statistics", response_model=OLTStatisticsResponse)
 async def task_olt_statistics():
     """Execute OLT统计 query, export to Excel, return preview and download link."""
@@ -2071,6 +2140,7 @@ async def task_olt_statistics():
         "rowCount": len(rows),
     }
 
+# 任务：FTTR 鉴别——支持按二级分光器或 ONU 名称查询与同机房推荐
 @app.post("/api/tasks/fttr-check", response_model=FTTRCheckResponse)
 async def task_fttr_check(request: FTTRCheckRequest):
     """FTTR鉴别：基于二级分光器或ONU名称。"""
@@ -2225,6 +2295,7 @@ async def task_fttr_check(request: FTTRCheckRequest):
         "rowCount": len(rows),
     }
 
+# 文件下载：根据登记的 file_uploads 记录安全返回本地生成文件
 @app.get("/api/files/download/{file_id}")
 async def download_file(file_id: str):
     """Download a generated/uploaded file by id."""
@@ -2247,6 +2318,7 @@ async def download_file(file_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"下载失败: {str(e)}")
 
+# 健康检查：返回服务状态与数据库连通性
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
@@ -2267,6 +2339,7 @@ async def health_check():
     return status
 
 # File upload & listing endpoints
+# 文件上传：保存到本地目录并登记数据库，按后缀自动触发后台导入
 @app.post("/api/files/upload")
 async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     global db_pool
@@ -2307,6 +2380,7 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"文件上传失败: {str(e)}")
 
+# 文件列表：查询 file_uploads 表中最近的上传与导入记录
 @app.get("/api/files")
 async def list_files():
     global db_pool
@@ -2322,6 +2396,7 @@ async def list_files():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取文件列表失败: {str(e)}")
 
+# 手动触发导入：根据扩展名安排 CSV/Excel 的后台导入任务
 @app.post("/api/files/import/{upload_id}")
 async def trigger_import(upload_id: str, background_tasks: BackgroundTasks):
     global db_pool
