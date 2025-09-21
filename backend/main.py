@@ -815,6 +815,29 @@ async def update_row_by_keys(connection: asyncpg.Connection, table_name: str, al
     params: List[Any] = [normalize_value_for_diff(row.get(c)) for c in set_columns] + [normalize_value_for_diff(row.get(k)) for k in key_columns]
     await connection.execute(sql, *params)
 
+# 批量更新：基于唯一键批量更新多行，使用 executemany 并打印进度
+async def bulk_update_rows_by_keys(
+    connection: asyncpg.Connection,
+    table_name: str,
+    all_columns: List[str],
+    key_columns: List[str],
+    rows: List[Dict[str, Any]]
+) -> int:
+    if not rows:
+        return 0
+    set_columns = [c for c in all_columns if c not in key_columns]
+    if not set_columns or not key_columns:
+        return 0
+    set_clause = ", ".join([f'"{c}" = ${i+1}' for i, c in enumerate(set_columns)])
+    where_clause = " and ".join([f'"{kc}" = ${len(set_columns) + idx + 1}' for idx, kc in enumerate(key_columns)])
+    sql = f'update "{table_name}" set {set_clause} where {where_clause}'
+    params_list: List[List[Any]] = []
+    for r in rows:
+        params = [normalize_value_for_diff(r.get(c)) for c in set_columns] + [normalize_value_for_diff(r.get(k)) for k in key_columns]
+        params_list.append(params)
+    await connection.executemany(sql, params_list)
+    return len(rows)
+
 # 以唯一键为条件的删除：当前主要用于对比类流程的占位
 async def delete_row_by_keys(connection: asyncpg.Connection, table_name: str, key_columns: List[str], row: Dict[str, Any]) -> None:
     if not key_columns:
@@ -883,8 +906,8 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
                     k = compute_key_tuple(key_row, unique_columns)
                     existing_key_set.add(k)
 
-        print("unique columns: {}".format(unique_columns))
-        print("detected existing key: ".format(len(existing_key_set)))
+        print("unique columns: {}".format(unique_columns), flush=True)
+        print("detected existing key: {}".format(len(existing_key_set)), flush=True)
         # Derive unique columns if not configured
         if not unique_columns:
             if new_rows:
@@ -935,15 +958,58 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
         # Do not print per-change logs; only log uploaded row count above
 
         # Write-back to DB
-        # 第四步：回写数据库——新增批量插入，更新按唯一键参数化更新
+        # 第四步：回写数据库——新增/更新使用批处理，并输出进度日志
         async with db_pool.acquire() as connw:
             await ensure_target_table(connw, target_table, list(new_rows[0].keys()) if new_rows else [])
-            # 根据上面的分类：新增执行插入；已存在的执行更新；不处理删除
             cols = list(new_rows[0].keys()) if new_rows else await get_existing_columns(connw, target_table)
-            for r in added_rows:
-                await bulk_insert_rows(connw, target_table, cols, [r])
-            for r in updated_new_rows:
-                await update_row_by_keys(connw, target_table, cols, unique_columns, r)
+
+            print(
+                "[diff-upload][writeback] start table={} add={} update={}".format(
+                    target_table, len(added_rows), len(updated_new_rows)
+                ),
+                flush=True,
+            )
+
+            # 批量插入新增数据
+            inserted_total = 0
+            if added_rows:
+                batch_size_ins = 1000
+                def _chunk(seq: List[Dict[str, Any]], size: int):
+                    for i in range(0, len(seq), size):
+                        yield seq[i:i+size]
+                for idx, batch in enumerate(_chunk(added_rows, batch_size_ins), start=1):
+                    inserted = await bulk_insert_rows(connw, target_table, cols, batch)
+                    inserted_total += inserted
+                    print(
+                        "[diff-upload][writeback][insert] batch {} size={} total_inserted={}".format(
+                            idx, len(batch), inserted_total
+                        ),
+                        flush=True,
+                    )
+
+            # 批量更新已存在数据
+            updated_total = 0
+            if updated_new_rows and unique_columns:
+                batch_size_upd = 500
+                def _chunk_u(seq: List[Dict[str, Any]], size: int):
+                    for i in range(0, len(seq), size):
+                        yield seq[i:i+size]
+                for idx, batch in enumerate(_chunk_u(updated_new_rows, batch_size_upd), start=1):
+                    updated = await bulk_update_rows_by_keys(connw, target_table, cols, unique_columns, batch)
+                    updated_total += updated
+                    print(
+                        "[diff-upload][writeback][update] batch {} size={} total_updated={}".format(
+                            idx, len(batch), updated_total
+                        ),
+                        flush=True,
+                    )
+
+            print(
+                "[diff-upload][writeback] done table={} inserted={} updated={}".format(
+                    target_table, inserted_total, updated_total
+                ),
+                flush=True,
+            )
 
         # Special post-processing for 家客业务信息表
         if dataset_key == "jiake_yewu_xinxi":
