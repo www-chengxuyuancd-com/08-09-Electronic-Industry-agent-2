@@ -188,6 +188,8 @@ app = FastAPI(
 )
 
 # CORS middleware
+# 支持通过环境变量指定公网前端来源，如使用内网穿透后的域名
+PUBLIC_WEB_ORIGIN = os.getenv("PUBLIC_WEB_ORIGIN")
 dev_allowed_origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
@@ -195,10 +197,14 @@ dev_allowed_origins = [
     "http://127.0.0.1:3001",
 ]
 
+allowed_origins = dev_allowed_origins.copy()
+if PUBLIC_WEB_ORIGIN:
+    allowed_origins.append(PUBLIC_WEB_ORIGIN)
+
 # 跨域设置：允许本地与局域网调试访问，方法与头部均放开
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=dev_allowed_origins,
+    allow_origins=allowed_origins,
     # Allow common LAN hosts like 192.168.x.x:port during development
     allow_origin_regex=r"http://(localhost|127\\.0\\.0\\.1|192\\.168\\.[0-9]{1,3}\\.[0-9]{1,3}|10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}|172\\.(1[6-9]|2[0-9]|3[0-1])\\.[0-9]{1,3}\\.[0-9]{1,3}):[0-9]+",
     allow_credentials=True,
