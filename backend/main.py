@@ -1242,8 +1242,13 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
                 flush=True,
             )
 
+        # Enter exporting phase: long-running file generation may take time
+        _progress_update(dataset_key, status="exporting", stage="exporting", percent=96)
+
         # Special post-processing for 家客业务信息表
         if dataset_key == "jiake_yewu_xinxi":
+            # Indicate start of post-processing/exporting
+            _progress_update(dataset_key, status="exporting", stage="exporting:postprocess-prepare", percent=96)
             # 1) Detect mismatches between jiake_yewu_xinxi (A) and wangguan_ONU_zaixianqingdan (B)
             async with db_pool.acquire() as connv:
                 mismatch_rows = await connv.fetch(
@@ -1284,6 +1289,8 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
                     "B.duan_kou_hao": r.get("duan_kou_hao"),
                 })
 
+            _progress_update(dataset_key, status="exporting", stage="exporting:postprocess-compare-built", percent=97)
+
             # Snapshot full table before update for row-wise comparison (sorted by xin_zeng_onu)
             async with db_pool.acquire() as connb:
                 before_rows_full = await fetch_all_rows(connb, "jiake_yewu_xinxi")
@@ -1310,6 +1317,8 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
                       )
                     """
                 )
+
+            _progress_update(dataset_key, status="exporting", stage="exporting:postprocess-updated-db", percent=98)
 
             # 3) Fetch modified table rows for sheet2
             async with db_pool.acquire() as connr:
@@ -1388,6 +1397,8 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
                                 ws_before.cell(row=row_idx, column=col_idx).fill = red_fill
                                 ws_after.cell(row=row_idx, column=col_idx).fill = red_fill
 
+            _progress_update(dataset_key, status="exporting", stage="exporting:postprocess-excel-written", percent=99)
+
             # Register generated file into DB
             try:
                 async with db_pool.acquire() as connr2:
@@ -1402,7 +1413,25 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
             export = {"id": export_id, "filename": filename, "path": path}
         else:
             # 删除统一视为 0，这里传入空列表以兼容导出函数签名
-            export = await export_diffs_excel(added_rows, updated_new_rows, [], base_filename=f"{display_name}-差异")
+            # Provide export progress callback to move UI from 96->99 during long Excel writes
+            async def _progress_export_cb(stage: str, done: int, total: int) -> None:
+                try:
+                    base_map = {"新增": 96, "修改": 97, "删除": 98}
+                    base = base_map.get(stage, 96)
+                    step = 1 if (total and done >= total) else 0
+                    percent = min(99, base + step)
+                    _progress_update(dataset_key, status="exporting", stage=f"exporting:{stage}", percent=percent)
+                except Exception:
+                    # Best-effort progress updates; ignore failures
+                    pass
+
+            export = await export_diffs_excel(
+                added_rows,
+                updated_new_rows,
+                [],
+                base_filename=f"{display_name}-差异",
+                progress_cb=_progress_export_cb,
+            )
 
         result = {
             "datasetKey": dataset_key,
