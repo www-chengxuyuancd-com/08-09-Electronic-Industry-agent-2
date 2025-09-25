@@ -42,15 +42,18 @@ export function useLLMStream(): UseLLMStreamReturn {
       setIsThinking(true);
 
       try {
-        const response = await fetch(`${BACKEND_URL}/api/call-llm-stream`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            userInput,
-          }),
-        });
+        const response = await fetch(
+          `${BACKEND_URL}/api/call-llm-stream`.replace(/\/\/+/, "/"),
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              userInput,
+            }),
+          }
+        );
 
         if (!response.ok) {
           throw new Error("API 请求失败");
