@@ -1291,9 +1291,24 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
 
             _progress_update(dataset_key, status="exporting", stage="exporting:postprocess-compare-built", percent=97)
 
-            # Snapshot full table before update for row-wise comparison (sorted by xin_zeng_onu)
+            # Only snapshot rows that are actually mismatched to avoid exporting the entire table
+            mismatch_keys: List[str] = []
+            try:
+                mismatch_keys = list({str(r.get("xin_zeng_onu")) for r in sheet1_rows if r.get("xin_zeng_onu")})
+            except Exception:
+                mismatch_keys = []
+
+            _progress_update(dataset_key, status="exporting", stage="exporting:postprocess-snapshot-before", percent=98)
+
             async with db_pool.acquire() as connb:
-                before_rows_full = await fetch_all_rows(connb, "jiake_yewu_xinxi")
+                if mismatch_keys:
+                    before_rows_full = await connb.fetch(
+                        "select * from jiake_yewu_xinxi where xin_zeng_onu = any($1::text[])",
+                        mismatch_keys,
+                    )
+                    before_rows_full = [serialize_db_result(dict(r)) for r in before_rows_full]
+                else:
+                    before_rows_full = []
             def sort_by_onu(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 try:
                     return sorted(rows, key=lambda r: (str(r.get("xin_zeng_onu") or "")))
@@ -1322,7 +1337,14 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
 
             # 3) Fetch modified table rows for sheet2
             async with db_pool.acquire() as connr:
-                modified_rows_full = await fetch_all_rows(connr, "jiake_yewu_xinxi")
+                if mismatch_keys:
+                    modified_rows_full = await connr.fetch(
+                        "select * from jiake_yewu_xinxi where xin_zeng_onu = any($1::text[])",
+                        mismatch_keys,
+                    )
+                    modified_rows_full = [serialize_db_result(dict(r)) for r in modified_rows_full]
+                else:
+                    modified_rows_full = []
             modified_rows_sorted = sort_by_onu(modified_rows_full)
             # Align after-rows columns to the same order as before-rows to ensure 1-1 mapping
             before_cols: List[str] = list(before_rows_sorted[0].keys()) if before_rows_sorted else (list(modified_rows_sorted[0].keys()) if modified_rows_sorted else [])
@@ -1396,6 +1418,12 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
                             if (v_before or None) != (v_after or None):
                                 ws_before.cell(row=row_idx, column=col_idx).fill = red_fill
                                 ws_after.cell(row=row_idx, column=col_idx).fill = red_fill
+                        # Periodically report progress during highlighting of large sheets
+                        if (row_idx % 1000) == 0:
+                            try:
+                                _progress_update(dataset_key, status="exporting", stage="exporting:postprocess-highlighting", percent=99)
+                            except Exception:
+                                pass
 
             _progress_update(dataset_key, status="exporting", stage="exporting:postprocess-excel-written", percent=99)
 
