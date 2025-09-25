@@ -35,6 +35,17 @@ export default function UploadPage() {
   const backend =
     process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
 
+  const isUploading = uploadingKey !== null;
+
+  const [progress, setProgress] = useState<{
+    status: string;
+    stage: string;
+    percent: number;
+    insertedTotal: number;
+    updatedTotal: number;
+    totalRows: number;
+  } | null>(null);
+
   const datasets: { key: string; title: string }[] = [
     { key: "wangguan_onu", title: "网管ONU在线清单" },
     { key: "ziguan_olt", title: "资管-OLT" },
@@ -54,10 +65,34 @@ export default function UploadPage() {
   }
 
   useEffect(() => {
+    // 初始加载一次即可，其余在上传/导入操作后手动刷新
     fetchFiles();
-    const timer = setInterval(fetchFiles, 3000);
-    return () => clearInterval(timer);
+    return () => {};
   }, []);
+
+  // Poll progress while uploading
+  useEffect(() => {
+    if (!uploadingKey) return;
+    let stop = false;
+    const tick = async () => {
+      try {
+        const res = await fetch(
+          `${backend}/api/datasets/${uploadingKey}/diff-progress`,
+          { cache: "no-store" }
+        );
+        if (res.ok) {
+          const data = await res.json();
+          if (!stop) setProgress(data);
+          if (data?.percent >= 100) return; // stop; wait for uploadDataset finally to clear state
+        }
+      } catch {}
+      if (!stop) setTimeout(tick, 1000);
+    };
+    tick();
+    return () => {
+      stop = true;
+    };
+  }, [uploadingKey, backend]);
 
   function onPickFile(key: string, f: File | null) {
     setSelectedFiles((prev) => ({ ...prev, [key]: f }));
@@ -67,6 +102,14 @@ export default function UploadPage() {
     const f = selectedFiles[key];
     if (!f) return;
     setUploadingKey(key);
+    setProgress({
+      status: "receiving",
+      stage: "receiving",
+      percent: 0,
+      insertedTotal: 0,
+      updatedTotal: 0,
+      totalRows: 0,
+    });
     try {
       const form = new FormData();
       form.append("file", f);
@@ -74,7 +117,24 @@ export default function UploadPage() {
         method: "POST",
         body: form,
       });
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) {
+        let message = "上传失败";
+        try {
+          const contentType = res.headers.get("content-type") || "";
+          if (contentType.includes("application/json")) {
+            const err = await res.json();
+            message =
+              (err?.detail && (err.detail.message || err.detail)) ||
+              err?.message ||
+              JSON.stringify(err);
+          } else {
+            message = await res.text();
+          }
+        } catch {}
+        console.error("diff-upload failed", res.status, message);
+        if (typeof window !== "undefined") alert(message);
+        return;
+      }
       const data = await res.json();
       setDiffResult(data);
       setSelectedFiles((prev) => ({ ...prev, [key]: null }));
@@ -83,6 +143,7 @@ export default function UploadPage() {
       console.error(e);
     } finally {
       setUploadingKey(null);
+      setProgress(null);
     }
   }
 
@@ -113,17 +174,43 @@ export default function UploadPage() {
                 <div className="flex items-center gap-2">
                   <Input
                     type="file"
+                    disabled={isUploading}
                     onChange={(e) =>
                       onPickFile(ds.key, e.target.files?.[0] ?? null)
                     }
                   />
                   <Button
                     onClick={() => uploadDataset(ds.key)}
-                    disabled={!selectedFiles[ds.key] || uploadingKey === ds.key}
+                    disabled={isUploading || !selectedFiles[ds.key]}
                   >
                     {uploadingKey === ds.key ? "上传中..." : "上传并对比"}
                   </Button>
                 </div>
+                {uploadingKey === ds.key && progress && (
+                  <div className="mt-2 space-y-1">
+                    <div className="h-2 w-full bg-muted rounded">
+                      <div
+                        className="h-2 bg-primary rounded"
+                        style={{
+                          width: `${Math.min(
+                            Math.max(progress.percent || 0, 0),
+                            100
+                          )}%`,
+                        }}
+                      />
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      阶段: {progress.stage || "-"} · 阶段进度:{" "}
+                      {Math.min(Math.max(progress.percent || 0, 0), 100)}% ·
+                      已处理:
+                      {(progress.insertedTotal ?? 0) +
+                        (progress.updatedTotal ?? 0)}
+                      /{progress.totalRows ?? 0} · 新增:
+                      {progress.insertedTotal ?? 0} 更新:
+                      {progress.updatedTotal ?? 0}
+                    </div>
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -168,7 +255,7 @@ export default function UploadPage() {
                 target="_blank"
                 rel="noreferrer"
               >
-                <Button variant="default">
+                <Button variant="default" disabled={isUploading}>
                   下载Excel ({diffResult.filename})
                 </Button>
               </a>
@@ -218,7 +305,11 @@ export default function UploadPage() {
                   <TableCell>{f.rows_imported ?? 0}</TableCell>
                   <TableCell>
                     {f.status === "uploaded" && (
-                      <Button size="sm" onClick={() => triggerImport(f.id)}>
+                      <Button
+                        size="sm"
+                        onClick={() => triggerImport(f.id)}
+                        disabled={isUploading}
+                      >
                         导入
                       </Button>
                     )}

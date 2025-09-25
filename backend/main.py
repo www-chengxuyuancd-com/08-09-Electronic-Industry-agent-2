@@ -30,6 +30,29 @@ from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl import Workbook
 
+# ---------------------------------------------------------------------------
+# In-memory progress tracking for diff-upload
+# ---------------------------------------------------------------------------
+# Keyed by dataset_key. This is process-local and resets on restart.
+PROGRESS_DIFF_UPLOAD: Dict[str, Any] = {}
+
+def _progress_init(dataset_key: str) -> None:
+    PROGRESS_DIFF_UPLOAD[dataset_key] = {
+        "status": "receiving",
+        "stage": "receiving",
+        "totalRows": 0,
+        "insertedTotal": 0,
+        "updatedTotal": 0,
+        "percent": 0,
+        "updatedAt": datetime.now().isoformat(),
+    }
+
+def _progress_update(dataset_key: str, **values: Any) -> None:
+    cur = PROGRESS_DIFF_UPLOAD.get(dataset_key) or {}
+    cur.update(values)
+    cur["updatedAt"] = datetime.now().isoformat()
+    PROGRESS_DIFF_UPLOAD[dataset_key] = cur
+
 # Load environment variables
 load_dotenv()
 # Config module import (dataset presets)
@@ -64,6 +87,14 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "deepseek")
 LLM_HTTP_TIMEOUT_SECONDS = int(os.getenv("LLM_HTTP_TIMEOUT_SECONDS", "30"))
 LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
 LLM_BACKOFF_BASE = float(os.getenv("LLM_BACKOFF_BASE", "0.8"))
+
+# diff-upload tuning via environment variables
+DIFF_INSERT_BATCH_SIZE = int(os.getenv("DIFF_INSERT_BATCH_SIZE", "1000"))
+DIFF_UPDATE_BATCH_SIZE = int(os.getenv("DIFF_UPDATE_BATCH_SIZE", "500"))
+DIFF_PARALLEL_WRITES = os.getenv("DIFF_PARALLEL_WRITES", "0") == "1"
+DIFF_WRITE_CONCURRENCY = int(os.getenv("DIFF_WRITE_CONCURRENCY", "2"))
+DIFF_USE_TEMP_TABLE = os.getenv("DIFF_USE_TEMP_TABLE", "0") == "1"
+DIFF_TEMP_UNLOGGED = os.getenv("DIFF_TEMP_UNLOGGED", "1") == "1"
 
 # Database schema (same as from the original TypeScript file)
 DB_SCHEMA = """
@@ -211,6 +242,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Progress inquiry endpoint for diff-upload
+@app.get("/api/datasets/{dataset_key}/diff-progress")
+async def get_diff_progress(dataset_key: str):
+    data = PROGRESS_DIFF_UPLOAD.get(dataset_key)
+    if not data:
+        return {
+            "status": "idle",
+            "stage": "idle",
+            "percent": 0,
+            "insertedTotal": 0,
+            "updatedTotal": 0,
+            "totalRows": 0,
+        }
+    return data
 
 # Pydantic models
 # 模型定义：用于接口的请求/响应校验与自动文档生成，便于前后端契约对齐
@@ -437,7 +483,7 @@ def extract_erji_fenguang_name(text: str) -> Optional[str]:
         return candidate if candidate else None
     return None
 
-# ONU 名称抽取：优先匹配“ONU用户/ONU”后引号内的名称
+# ONU 名称抽取：优先匹配"ONU用户/ONU"后引号内的名称
 def extract_onu_name(text: str) -> Optional[str]:
     """Extract ONU用户名称 from free text.
     - Prefer names inside quotes near keywords like ONU/ONU用户
@@ -606,7 +652,7 @@ def rows_to_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     cols = list(rows[0].keys())
     return pd.DataFrame(rows, columns=cols)
 
-# 导出差异 Excel：分别输出“新增/修改/删除”三个工作表，并登记到库
+# 导出差异 Excel：分别输出"新增/修改/删除"三个工作表，并登记到库
 async def export_diffs_excel(
     added: List[Dict[str, Any]],
     updated_new: List[Dict[str, Any]],
@@ -852,6 +898,46 @@ async def ensure_target_table(connection: asyncpg.Connection, table_name: str, c
             except Exception:
                 pass
 
+async def ensure_indexes_for_table(
+    connection: asyncpg.Connection,
+    table_name: str,
+    key_columns: List[str]
+) -> None:
+    """Ensure helpful indexes exist for diff-upload performance.
+
+    - Create a composite btree index on unique key columns for DISTINCT and WHERE lookups
+    - Also create single-column indexes for multi-column unique keys to help partial filters
+    """
+    try:
+        if not key_columns:
+            return
+
+        # Sanitize pieces to build index names within postgres identifier length limits (63 bytes)
+        def _safe_name_part(s: str) -> str:
+            s2 = sanitize_identifier(s)
+            return s2[:40] if len(s2) > 40 else s2
+
+        tbl_part = _safe_name_part(table_name)
+        cols_part = "_".join([_safe_name_part(c) for c in key_columns])
+        composite_index_name = f"idx_{tbl_part}_{cols_part}"
+
+        cols_sql = ", ".join([f'"{c}"' for c in key_columns])
+        # Composite index helps DISTINCT and multi-column WHERE
+        await connection.execute(
+            f'create index if not exists {composite_index_name} on "{table_name}" ({cols_sql});'
+        )
+
+        # Additionally, single-column indexes help when planner can use individual filters
+        if len(key_columns) > 1:
+            for c in key_columns:
+                single_index_name = f"idx_{tbl_part}_{_safe_name_part(c)}"
+                await connection.execute(
+                    f'create index if not exists {single_index_name} on "{table_name}" ("{c}");'
+                )
+    except Exception:
+        # Best-effort indexing; do not fail main flow on index errors
+        pass
+
 # 批量插入：按给定列顺序批量写入，提高导入效率
 async def bulk_insert_rows(connection: asyncpg.Connection, table_name: str, columns: List[str], rows: List[Dict[str, Any]]) -> int:
     if not rows:
@@ -916,6 +1002,7 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
     if not file:
         raise HTTPException(status_code=400, detail="缺少上传文件")
     try:
+        _progress_init(dataset_key)
         # 第一步：读取数据集配置与确保元表存在
         async with db_pool.acquire() as conn:
             await ensure_migrations_tables(conn)
@@ -942,75 +1029,104 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
         new_rows = await parse_tabular_file_to_rows(target_path)
         total_rows = len(new_rows)
         print(f"[diff-upload] key={dataset_key} name={file.filename} size={total_rows}")
+        _progress_update(dataset_key, status="classifying", stage="classifying", totalRows=total_rows, percent=5)
 
-        # 基于数据库中“唯一键列”的去重集合来判定是新增还是更新
-        # 说明：与其把整表读出来再比对整行（既耗时也占内存），
-        #      这里只从数据库中查询 unique_columns 的去重值集合（distinct），
-        #      然后用上传数据里的对应唯一键值去命中该集合：命中=更新，不命中=新增。
-        #      一般不会有“删除行”的需求，删除视为 0，不在这里处理。
-        # 第二步：构建库内唯一键“存在性集合”，用以判定新增/更新
-        async with db_pool.acquire() as conn2:
-            # 确保目标表存在且列齐全（会根据上传文件的列进行补充）
-            detected_columns: List[str] = list(new_rows[0].keys()) if new_rows else []
-            await ensure_target_table(conn2, target_table, detected_columns)
-            # 组装并执行 DISTINCT 查询，仅拉取唯一键列的组合值
-            # 注意：unique_columns 在上方将被保证至少有 1 列（若配置缺失，则兜底为首列）
-            existing_key_set: Set[Tuple[Any, ...]] = set()
-            if unique_columns:
-                cols_sql = ", ".join([f'"{c}"' for c in unique_columns])
-                sql_distinct = f'select distinct {cols_sql} from "{target_table}"'
-                rows = await conn2.fetch(sql_distinct)
-                for rec in rows:
-                    # 仅保留唯一键列，构造与 compute_key_tuple 相容的字典
-                    key_row = {c: rec.get(c) for c in unique_columns}
-                    k = compute_key_tuple(key_row, unique_columns)
-                    existing_key_set.add(k)
-
-        print("unique columns: {}".format(unique_columns), flush=True)
-        print("detected existing key: {}".format(len(existing_key_set)), flush=True)
-        # Derive unique columns if not configured
-        if not unique_columns:
-            if new_rows:
-                unique_columns = [list(new_rows[0].keys())[0]]
-            else:
-                unique_columns = []
-
-        # 注意：不再构建旧数据整行索引 old_index，仅保留唯一键的存在性集合 existing_key_set
-
-        # 将上传行划分为：新增/更新/重复（上传文件内部重复）。不再处理“删除”。
+        # 第二步：根据配置选择分类策略（临时/未记录表对比，或内存集合对比）
         added_rows: List[Dict[str, Any]] = []
         updated_new_rows: List[Dict[str, Any]] = []
         duplicate_count = 0
-        # seen_keys 用于识别“同一批上传数据内部”的重复键，避免重复计算和重复写入
-        seen_keys: set[Tuple[Any, ...]] = set()
 
-        # 取消“操作/状态列”的解析与删除行为识别。业务约定：一般不会有删除行，这里始终视为 0。
+        if DIFF_USE_TEMP_TABLE:
+            async with db_pool.acquire() as conn2:
+                detected_columns: List[str] = list(new_rows[0].keys()) if new_rows else []
+                await ensure_target_table(conn2, target_table, detected_columns)
+                if not unique_columns:
+                    unique_columns = [detected_columns[0]] if detected_columns else []
+                await ensure_indexes_for_table(conn2, target_table, unique_columns)
 
-        def _rows_equal_excluding_keys(a: Dict[str, Any], b: Dict[str, Any], key_cols: List[str]) -> bool:
-            a_norm = {c: normalize_value_for_diff(v) for c, v in a.items() if c not in key_cols}
-            b_norm = {c: normalize_value_for_diff(v) for c, v in b.items() if c not in key_cols}
-            all_cols = set(a_norm.keys()) | set(b_norm.keys())
-            for c in all_cols:
-                if (a_norm.get(c) or None) != (b_norm.get(c) or None):
-                    return False
-            return True
+                staging_name = f"_diff_stage_{uuid.uuid4().hex[:8]}"
+                if detected_columns:
+                    cols_def = ", ".join([f'"{c}" text' for c in detected_columns])
+                else:
+                    cols_def = '"col" text'
+                if DIFF_TEMP_UNLOGGED:
+                    await conn2.execute(f'create unlogged table "{staging_name}" ({cols_def});')
+                else:
+                    await conn2.execute(f'create temporary table "{staging_name}" ({cols_def}) on commit drop;')
 
-        # 遍历上传行：
-        # - 若同一键在本次上传中已出现过，则计入 duplicate_count，跳过
-        # - 若该键存在于数据库的 existing_key_set，则归为“更新”
-        # - 否则归为“新增”
-        # 第三步：遍历上传数据，利用 existing_key_set 判定类别
-        for r in new_rows:
-            k = compute_key_tuple(r, unique_columns)
-            if k in seen_keys:
-                duplicate_count += 1
-                continue
-            seen_keys.add(k)
+                if detected_columns and new_rows:
+                    placeholders = ", ".join([f"${i+1}" for i in range(len(detected_columns))])
+                    insert_stage_sql = f'insert into "{staging_name}" ({", ".join([f"\"{c}\"" for c in detected_columns])}) values ({placeholders})'
+                    def _chunk_stage(seq: List[Dict[str, Any]], size: int):
+                        for i in range(0, len(seq), size):
+                            yield seq[i:i+size]
+                    for batch in _chunk_stage(new_rows, DIFF_INSERT_BATCH_SIZE):
+                        values_list = []
+                        for r in batch:
+                            values_list.append([normalize_value_for_diff(r.get(c)) for c in detected_columns])
+                        await conn2.executemany(insert_stage_sql, values_list)
 
-            if k in existing_key_set:
-                updated_new_rows.append(r)
-            else:
-                added_rows.append(r)
+                await ensure_indexes_for_table(conn2, staging_name, unique_columns)
+
+                if unique_columns:
+                    on_clause = " and ".join([f's."{kc}" = t."{kc}"' for kc in unique_columns])
+                    null_check = f't."{unique_columns[0]}" is null'
+                    cols_list_sql = ", ".join([f's."{c}"' for c in detected_columns]) if detected_columns else "s.*"
+                    added_sql = f'select {cols_list_sql} from "{staging_name}" s left join "{target_table}" t on {on_clause} where {null_check}'
+                    updated_sql = f'select {cols_list_sql} from "{staging_name}" s join "{target_table}" t on {on_clause}'
+                else:
+                    cols_list_sql = ", ".join([f's."{c}"' for c in detected_columns]) if detected_columns else "s.*"
+                    added_sql = f'select {cols_list_sql} from "{staging_name}" s'
+                    updated_sql = 'select null where false'
+
+                rows_added = await conn2.fetch(added_sql)
+                rows_updated = await conn2.fetch(updated_sql)
+                added_rows = [serialize_db_result(dict(r)) for r in rows_added]
+                updated_new_rows = [serialize_db_result(dict(r)) for r in rows_updated]
+
+                print(f"[diff-upload][classified][stage] rows={total_rows} add={len(added_rows)} update={len(updated_new_rows)}")
+
+                if DIFF_TEMP_UNLOGGED:
+                    try:
+                        await conn2.execute(f'drop table if exists "{staging_name}"')
+                    except Exception:
+                        pass
+        else:
+            async with db_pool.acquire() as conn2:
+                detected_columns: List[str] = list(new_rows[0].keys()) if new_rows else []
+                await ensure_target_table(conn2, target_table, detected_columns)
+                if not unique_columns:
+                    if detected_columns:
+                        unique_columns = [detected_columns[0]]
+                    else:
+                        unique_columns = []
+                await ensure_indexes_for_table(conn2, target_table, unique_columns)
+                existing_key_set: Set[Tuple[Any, ...]] = set()
+                if unique_columns:
+                    cols_sql = ", ".join([f'"{c}"' for c in unique_columns])
+                    sql_distinct = f'select distinct {cols_sql} from "{target_table}"'
+                    rows = await conn2.fetch(sql_distinct)
+                    for rec in rows:
+                        key_row = {c: rec.get(c) for c in unique_columns}
+                        k = compute_key_tuple(key_row, unique_columns)
+                        existing_key_set.add(k)
+
+            print("unique columns: {}".format(unique_columns), flush=True)
+            print("detected existing key: {}".format(len(existing_key_set)), flush=True)
+
+            seen_keys: set[Tuple[Any, ...]] = set()
+            for r in new_rows:
+                k = compute_key_tuple(r, unique_columns)
+                if k in seen_keys:
+                    duplicate_count += 1
+                    continue
+                seen_keys.add(k)
+                if unique_columns and (k in existing_key_set):
+                    updated_new_rows.append(r)
+                else:
+                    added_rows.append(r)
+
+            print(f"[diff-upload][classified] rows={total_rows} add={len(added_rows)} update={len(updated_new_rows)} duplicate={duplicate_count}")
 
         # 分类结果日志：仅包含新增、更新、（上传内部）重复；删除固定为 0
         print(f"[diff-upload][classified] rows={total_rows} add={len(added_rows)} update={len(updated_new_rows)} duplicate={duplicate_count}")
@@ -1033,36 +1149,91 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
             # 批量插入新增数据
             inserted_total = 0
             if added_rows:
-                batch_size_ins = 1000
+                batch_size_ins = DIFF_INSERT_BATCH_SIZE
                 def _chunk(seq: List[Dict[str, Any]], size: int):
                     for i in range(0, len(seq), size):
                         yield seq[i:i+size]
-                for idx, batch in enumerate(_chunk(added_rows, batch_size_ins), start=1):
-                    inserted = await bulk_insert_rows(connw, target_table, cols, batch)
-                    inserted_total += inserted
-                    print(
-                        "[diff-upload][writeback][insert] batch {} size={} total_inserted={}".format(
-                            idx, len(batch), inserted_total
-                        ),
-                        flush=True,
-                    )
+                if DIFF_PARALLEL_WRITES and DIFF_WRITE_CONCURRENCY > 1:
+                    # Parallelize insert batches
+                    sem = asyncio.Semaphore(DIFF_WRITE_CONCURRENCY)
+                    async def _run_insert(batch_idx: int, batch_rows: List[Dict[str, Any]]):
+                        nonlocal inserted_total
+                        async with sem:
+                            inserted = await bulk_insert_rows(connw, target_table, cols, batch_rows)
+                            inserted_total += inserted
+                            print(
+                                "[diff-upload][writeback][insert] batch {} size={} total_inserted={}".format(
+                                    batch_idx, len(batch_rows), inserted_total
+                                ),
+                                flush=True,
+                            )
+                            insert_weight = 50
+                            insert_percent = int(min(100, 10 + insert_weight * (inserted_total / max(1, len(added_rows)))))
+                            _progress_update(dataset_key, status="writing", stage="inserting", insertedTotal=inserted_total, percent=min(insert_percent, 80))
+
+                    tasks_ins: List[asyncio.Task] = []
+                    for idx, batch in enumerate(_chunk(added_rows, batch_size_ins), start=1):
+                        tasks_ins.append(asyncio.create_task(_run_insert(idx, batch)))
+                    if tasks_ins:
+                        await asyncio.gather(*tasks_ins)
+                else:
+                    for idx, batch in enumerate(_chunk(added_rows, batch_size_ins), start=1):
+                        inserted = await bulk_insert_rows(connw, target_table, cols, batch)
+                        inserted_total += inserted
+                        print(
+                            "[diff-upload][writeback][insert] batch {} size={} total_inserted={}".format(
+                                idx, len(batch), inserted_total
+                            ),
+                            flush=True,
+                        )
+                        insert_weight = 50
+                        insert_percent = int(min(100, 10 + insert_weight * (inserted_total / max(1, len(added_rows)))))
+                        _progress_update(dataset_key, status="writing", stage="inserting", insertedTotal=inserted_total, percent=min(insert_percent, 80))
 
             # 批量更新已存在数据
             updated_total = 0
             if updated_new_rows and unique_columns:
-                batch_size_upd = 500
+                batch_size_upd = DIFF_UPDATE_BATCH_SIZE
                 def _chunk_u(seq: List[Dict[str, Any]], size: int):
                     for i in range(0, len(seq), size):
                         yield seq[i:i+size]
-                for idx, batch in enumerate(_chunk_u(updated_new_rows, batch_size_upd), start=1):
-                    updated = await bulk_update_rows_by_keys(connw, target_table, cols, unique_columns, batch)
-                    updated_total += updated
-                    print(
-                        "[diff-upload][writeback][update] batch {} size={} total_updated={}".format(
-                            idx, len(batch), updated_total
-                        ),
-                        flush=True,
-                    )
+                if DIFF_PARALLEL_WRITES and DIFF_WRITE_CONCURRENCY > 1:
+                    sem_u = asyncio.Semaphore(DIFF_WRITE_CONCURRENCY)
+                    async def _run_update(batch_idx: int, batch_rows: List[Dict[str, Any]]):
+                        nonlocal updated_total
+                        async with sem_u:
+                            updated = await bulk_update_rows_by_keys(connw, target_table, cols, unique_columns, batch_rows)
+                            updated_total += updated
+                            print(
+                                "[diff-upload][writeback][update] batch {} size={} total_updated={}".format(
+                                    batch_idx, len(batch_rows), updated_total
+                                ),
+                                flush=True,
+                            )
+                            update_weight = 40
+                            total_work = max(1, len(updated_new_rows))
+                            update_percent = int(min(100, 60 + update_weight * (updated_total / total_work)))
+                            _progress_update(dataset_key, status="writing", stage="updating", updatedTotal=updated_total, percent=min(update_percent, 95))
+
+                    tasks_upd: List[asyncio.Task] = []
+                    for idx, batch in enumerate(_chunk_u(updated_new_rows, batch_size_upd), start=1):
+                        tasks_upd.append(asyncio.create_task(_run_update(idx, batch)))
+                    if tasks_upd:
+                        await asyncio.gather(*tasks_upd)
+                else:
+                    for idx, batch in enumerate(_chunk_u(updated_new_rows, batch_size_upd), start=1):
+                        updated = await bulk_update_rows_by_keys(connw, target_table, cols, unique_columns, batch)
+                        updated_total += updated
+                        print(
+                            "[diff-upload][writeback][update] batch {} size={} total_updated={}".format(
+                                idx, len(batch), updated_total
+                            ),
+                            flush=True,
+                        )
+                        update_weight = 40
+                        total_work = max(1, len(updated_new_rows))
+                        update_percent = int(min(100, 60 + update_weight * (updated_total / total_work)))
+                        _progress_update(dataset_key, status="writing", stage="updating", updatedTotal=updated_total, percent=min(update_percent, 95))
 
             print(
                 "[diff-upload][writeback] done table={} inserted={} updated={}".format(
@@ -1233,7 +1404,7 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
             # 删除统一视为 0，这里传入空列表以兼容导出函数签名
             export = await export_diffs_excel(added_rows, updated_new_rows, [], base_filename=f"{display_name}-差异")
 
-        return {
+        result = {
             "datasetKey": dataset_key,
             "displayName": display_name,
             "targetTable": target_table,
@@ -1247,6 +1418,8 @@ async def dataset_diff_upload(dataset_key: str, file: UploadFile = File(...)):
             "downloadUrl": f"/api/files/download/{export['id']}",
             "uniqueColumns": unique_columns,
         }
+        _progress_update(dataset_key, status="done", stage="done", percent=100)
+        return result
     except HTTPException:
         raise
     except Exception as e:
@@ -1388,7 +1561,7 @@ async def import_csv_background(upload_id: str, file_path: str) -> None:
             # Detect encoding and read headers
             detected_encoding = _detect_csv_encoding(file_path)
             print(f"[csv] start id={upload_id} path={file_path} encoding={detected_encoding}")
-            # 单次读取表头用于生成“结构签名”，后续可复用相同结构的数据表
+            # 单次读取表头用于生成"结构签名"，后续可复用相同结构的数据表
             with open(file_path, mode="r", encoding=detected_encoding, newline="") as f_sync:
                 reader_sync = csv.reader(f_sync)
                 headers = next(reader_sync)
@@ -1798,7 +1971,7 @@ class OpenAIClient:
                     raise HTTPException(status_code=500, detail=f"OpenAI API Error: {e.__class__.__name__}: {str(e)}")
                 raise HTTPException(status_code=500, detail=f"OpenAI API Error: {e.__class__.__name__}: {str(e)}")
 
-# Gemini 客户端：简单封装，提供“伪流式”分片输出
+# Gemini 客户端：简单封装，提供"伪流式"分片输出
 class GeminiClient:
     """Gemini API client"""
     
@@ -1999,7 +2172,7 @@ async def call_llm(request: LLMRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM处理错误: {e.__class__.__name__}: {str(e)}")
 
-# 流式 LLM 接口：先返回“思考”再按块推送 SQL 模板
+# 流式 LLM 接口：先返回"思考"再按块推送 SQL 模板
 @app.post("/api/call-llm-stream")
 async def call_llm_stream(request: LLMStreamRequest):
     """Stream fixed SQL template chunks based on intent (UTF-8 JSON, unescaped)."""
@@ -2134,7 +2307,7 @@ async def execute_sql_query(request: SQLQueryRequest):
                         # Extract all quoted literals and choose the most likely candidate
                         candidates: list[str] = []
                         candidates += [m.strip() for m in re.findall(r"'(.*?)'", cleaned_sql)]
-                        candidates += [m.strip() for m in re.findall(r"“(.*?)”", cleaned_sql)]
+                        candidates += [m.strip() for m in re.findall(r"\"(.*?)\"", cleaned_sql)]
                         candidates += [m.strip() for m in re.findall(r"「(.*?)」", cleaned_sql)]
                         # Prefer those containing 'ONU' (case-insensitive), otherwise the longest one
                         best = None
